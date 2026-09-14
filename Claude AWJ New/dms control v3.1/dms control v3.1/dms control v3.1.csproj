@@ -1,0 +1,204 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="12.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{A6BC98BB-54C7-4F37-AAA9-80308C2B4675}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>dms_control_v3</RootNamespace>
+    <AssemblyName>dms control</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <TargetFrameworkProfile />
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>out\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>out\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ApplicationIcon>sine.ico</ApplicationIcon>
+  </PropertyGroup>
+  <PropertyGroup>
+    <NoWin32Manifest>true</NoWin32Manifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="BaseSequence">
+      <HintPath>..\..\..\..\..\..\Programming\NET\BaseSequence\out\BaseSequence.dll</HintPath>
+    </Reference>
+    <Reference Include="Convertions">
+      <HintPath>..\..\..\..\..\..\Programming\NET\Convertions\Convertions\out\Convertions.dll</HintPath>
+    </Reference>
+    <Reference Include="DgSystem">
+      <HintPath>..\..\..\..\..\..\Programming\NET\DebugWindow\DebugWindow\out\DgSystem.dll</HintPath>
+    </Reference>
+    <Reference Include="LibUsbDotNet, Version=2.2.8.104, Culture=neutral, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>..\..\dms_control_v3\dms_control_v3\out\LibUsbDotNet.dll</HintPath>
+    </Reference>
+    <Reference Include="MathLibrary">
+      <HintPath>..\..\..\..\..\..\Programming\NET\MathLibrary\out\MathLibrary.dll</HintPath>
+    </Reference>
+    <Reference Include="ProjectConfiguration">
+      <HintPath>..\..\..\..\..\..\Programming\NET\ProjectConfiguration\out\ProjectConfiguration.dll</HintPath>
+    </Reference>
+    <Reference Include="System">
+      <HintPath>..\..\..\..\..\..\..\..\..\..\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\System.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Core" />
+    <Reference Include="System.Xml.Linq" />
+    <Reference Include="System.Data.DataSetExtensions" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.Deployment" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Xml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AD9106_PatternGenerator.cs" />
+    <Compile Include="PerformanceMonitor.cs" />
+    <Compile Include="DmsDevice.cs" />
+    <Compile Include="FmAbout.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmAbout.designer.cs">
+      <DependentUpon>FmAbout.cs</DependentUpon>
+    </Compile>
+    <Compile Include="FmFrequencySwitch.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmFrequencySwitch.Designer.cs">
+      <DependentUpon>FmFrequencySwitch.cs</DependentUpon>
+    </Compile>
+    <Compile Include="FmDdsConfiguration.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmDdsConfiguration.Designer.cs">
+      <DependentUpon>FmDdsConfiguration.cs</DependentUpon>
+    </Compile>
+    <Compile Include="FmDeviceInformation.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmDeviceInformation.Designer.cs">
+      <DependentUpon>FmDeviceInformation.cs</DependentUpon>
+    </Compile>
+    <Compile Include="FmMain.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmMain.Designer.cs">
+      <DependentUpon>FmMain.cs</DependentUpon>
+    </Compile>
+    <Compile Include="FmMax2871.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="FmMax2871.Designer.cs">
+      <DependentUpon>FmMax2871.cs</DependentUpon>
+    </Compile>
+    <Compile Include="Program.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="RF Library\AD5932.cs" />
+    <Compile Include="RF Library\AD9106.cs" />
+    <Compile Include="RF Library\BaseRegister.cs" />
+    <Compile Include="RF Library\MAX2871.cs" />
+    <Compile Include="RF Library\Synthesizer.cs" />
+    <Compile Include="Sequence\AD9106_PatternMemorySequences.cs" />
+    <Compile Include="Sequence\SequenceCallFunction.cs" />
+    <Compile Include="Sequence\SequenceDefaultState.cs" />
+    <Compile Include="Sequence\SequenceDelay.cs" />
+    <Compile Include="Sequence\SequenceGetDacAttenuator.cs" />
+    <Compile Include="Sequence\SequenceGetDDSCtrlFrequency.cs" />
+    <Compile Include="Sequence\SequenceGetDetectorCtrl.cs" />
+    <Compile Include="Sequence\SequenceGetPulseModulator.cs">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="Sequence\SequenceGetRegisterDDS.cs" />
+    <Compile Include="Sequence\SequenceGetState.cs" />
+    <Compile Include="Sequence\SequenceGetSweepDDS.cs" />
+    <Compile Include="Sequence\SequenceGetSweepLoParameters.cs" />
+    <Compile Include="Sequence\SequenceGetVersion.cs" />
+    <Compile Include="Sequence\SequenceReadMemory.cs" />
+    <Compile Include="Sequence\SequenceReadRegisterPLL.cs" />
+    <Compile Include="Sequence\SequenceSetDacAttenuator.cs" />
+    <Compile Include="Sequence\SequenceSetDDSCtrlFrequency.cs" />
+    <Compile Include="Sequence\SequenceSetDetectorCtrl.cs" />
+    <Compile Include="Sequence\SequenceResetDDS.cs" />
+    <Compile Include="Sequence\SequenceSetPulseModulator.cs" />
+    <Compile Include="Sequence\SequenceSetRegisterDDS.cs" />
+    <Compile Include="Sequence\SequenceSetRampDDS.cs" />
+    <Compile Include="Sequence\SequenceSetSweepDDS.cs" />
+    <Compile Include="Sequence\SequenceSetSweepLoParameters.cs" />
+    <Compile Include="Sequence\SequenceTestConnection.cs" />
+    <Compile Include="Sequence\SequenceWriteMemory.cs" />
+    <Compile Include="Sequence\SequenceWriteRegisterPLL.cs" />
+    <Compile Include="SystemCommands.cs" />
+    <EmbeddedResource Include="FmAbout.resx">
+      <DependentUpon>FmAbout.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="FmFrequencySwitch.resx">
+      <DependentUpon>FmFrequencySwitch.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="FmDdsConfiguration.resx">
+      <DependentUpon>FmDdsConfiguration.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="FmDeviceInformation.resx">
+      <DependentUpon>FmDeviceInformation.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="FmMain.resx">
+      <DependentUpon>FmMain.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="FmMax2871.resx">
+      <DependentUpon>FmMax2871.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <SubType>Designer</SubType>
+    </EmbeddedResource>
+    <Compile Include="Properties\Resources.Designer.cs">
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+      <DesignTime>True</DesignTime>
+    </Compile>
+    <None Include="Properties\Settings.settings">
+      <Generator>SettingsSingleFileGenerator</Generator>
+      <LastGenOutput>Settings.Designer.cs</LastGenOutput>
+    </None>
+    <Compile Include="Properties\Settings.Designer.cs">
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Settings.settings</DependentUpon>
+      <DesignTimeSharedInput>True</DesignTimeSharedInput>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="App.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="K9.ico" />
+    <Content Include="sine.ico" />
+  </ItemGroup>
+  <ItemGroup />
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
+       Other similar extension points exist, see Microsoft.Common.targets.
+  <Target Name="BeforeBuild">
+  </Target>
+  <Target Name="AfterBuild">
+  </Target>
+  -->
+</Project>

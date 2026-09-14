@@ -1,0 +1,1209 @@
+/****************************************************************************
+ * @file:		dms_functions.c												*
+ * @project:	DMS 3.5...3.8 GHz											*
+ * @author:		Kirillov A.V.												*
+ ****************************************************************************/
+#define __C_DMS_FUNCTIONS_
+
+/****************************************************************************
+ *					INCLUDES												*
+ ****************************************************************************/
+#include <dms_functions.h>
+#include <usbd_def.h>
+#include "usb_bulk.h"
+#include "detector.h"
+#include <stdlib.h>
+
+/****************************************************************************
+ *						MCU HARDWARE BLOCKS									*
+ ****************************************************************************/
+extern ADC_HandleTypeDef hadc1;
+extern DAC_HandleTypeDef hdac;
+extern I2C_HandleTypeDef hi2c1;
+extern SPI_HandleTypeDef hspi2;
+extern SPI_HandleTypeDef hspi3;
+extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
+extern TIM_HandleTypeDef htim3;
+extern TIM_HandleTypeDef htim4;
+extern TIM_HandleTypeDef htim5;
+
+/****************************************************************************
+ *						VARIABLES											*
+ ****************************************************************************/
+/** @brief	Количество функций в потоке №1.									*/
+static int		dms_thread1_size  = 4;
+/** @brief	Количество функций в потоке №2.									*/
+static int		dms_thread2_size  = 4;
+/** @brief	Индекс текущей функции потока №1.								*/
+static int		dms_thread1_index = 0;
+/** @brief	Индекс текущей функции потока №2.								*/
+static int		dms_thread2_index = 0;
+
+/** @brief	Счетчик моргания светодиода.									*/
+static long		dms_led_counter	= 0;
+/** @brief	Счетчик перестройки.											*/
+volatile long	dms_sweep_cnt   = 0;
+/** @brief Служебный счетчик для ожидания переходного процесса				*/
+static uint32_t	dms_pll_wait_cnt = 0;
+
+/****************************************************************************/
+/** 			ТАЙМЕР №3													*/
+/** @brief Счетчик прерывания таймера №3									*/
+volatile int		timer3_status;
+volatile uint32_t	timer3_irq;
+volatile uint32_t	timer3_cnt;
+tsActionTimer		acTimer3;
+
+/****************************************************************************/
+/** 			ТАЙМЕР №5													*/
+/** @brief Счетчик прерывания таймера №5									*/
+int				timer5_status;
+uint32_t		timer5_irq;
+uint32_t		timer5_cnt;
+tsActionTimer	acTimer5;
+
+/** @brief	Массив для приема данных через BULK								*/
+uint8_t 		usb_rx_buff[256];
+/** @brief	Счетчик данных принятых через BULK 								*/
+uint16_t		usb_rx_counter;
+/** @brief	Массив для отправки данных через BULK							*/
+uint8_t 		usb_tx_buff[256];
+/** @brief	Счетчик данных которые должны быть отправлены через BULK 		*/
+uint16_t		usb_tx_counter;
+
+/****************************************************************************
+ *						EXTERN VARIABLES									*
+ ****************************************************************************/
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
+/****************************************************************************
+ *						STATIC FUNCTIONS									*
+ ****************************************************************************/
+void dms_calc_frequency					( void );
+int dms_get_switch_state 				( void );
+
+/****************************************************************************
+ *				LOCAL DECLARATION OF THE THREAD FUNCTIONS					*
+ ****************************************************************************/
+static void dms_led_blinking 			( void );
+static void dms_check_recv_data 		( void );
+static void dms_send_data 				( void );
+static void dms_check_switch_state		( void );
+static void dms_check_detector_voltage	( void );
+static void dms_sweep_lo 				( void );
+static void dms_dds_control				( void );
+
+/**
+ * @brief Array functions of the thread #1.
+ */
+void (*dms_thread1_funcs[]) ( void ) = {
+	dms_check_recv_data,
+	dms_send_data,
+	dms_dds_control,
+};
+
+/**
+ * @brief Array functions of the thread #2.
+ */
+void (*dms_thread2_funcs[]) ( void ) = {
+	dms_led_blinking,
+	dms_check_switch_state,
+	dms_check_detector_voltage,
+	dms_sweep_lo,
+};
+
+/****************************************************************************
+ *				  APPLICATION FUNCTIONS										*
+ ****************************************************************************/
+/**
+ * @brief	Настройка таймера.
+ * @param	flag - Флаг управления.
+ * @retval	NONE
+ */
+static void dms_dds_ctrl_config			( int flag )
+{
+  	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	
+	GPIO_InitStruct.Pin = DDS_CTRL_Pin;
+	if (flag==0)
+	{
+		GPIO_InitStruct.Mode  		= GPIO_MODE_OUTPUT_PP;
+		GPIO_InitStruct.Pull  		= GPIO_NOPULL;
+		GPIO_InitStruct.Speed 		= GPIO_SPEED_FREQ_LOW;
+	}
+	else
+	{
+		GPIO_InitStruct.Mode 		= GPIO_MODE_AF_PP;
+		GPIO_InitStruct.Pull 		= GPIO_NOPULL;
+		GPIO_InitStruct.Speed		= GPIO_SPEED_FREQ_LOW;
+		GPIO_InitStruct.Alternate	= GPIO_AF2_TIM4;
+	}
+    HAL_GPIO_Init ( DDS_CTRL_GPIO_Port, &GPIO_InitStruct );
+}
+
+#if (DMS_DIP_ATTENUATOR_CONTROL==1)
+/**
+ * @brief	The function control of attenuator.
+ * @param	attenuator_ctrl - Состояние аттенюатора.
+ * @retval	NONE.
+ */
+static void dms_attenuator_control 		(  )
+{
+	int attenuator_ctrl = 0;
+
+	attenuator_ctrl = ( HAL_GPIO_ReadPin ( ATT_SW1_GPIO_Port, ATT_SW1_Pin ) == GPIO_PIN_RESET ) ? 0 : 1;
+	if ( attenuator_ctrl==0 )
+	{
+		attenuator_ctrl = ( HAL_GPIO_ReadPin ( ATT_SW2_GPIO_Port, ATT_SW2_Pin ) == GPIO_PIN_RESET ) ? 0 : 2;
+	}
+	else if ( attenuator_ctrl==0 )
+	{
+		attenuator_ctrl = ( HAL_GPIO_ReadPin ( ATT_SW3_GPIO_Port, ATT_SW3_Pin ) == GPIO_PIN_RESET ) ? 0 : 3;
+	}
+
+	//	Запуск ЦАП, установка предыдущего напряжения.
+	HAL_DAC_Start 	  ( &hdac, DAC1_CHANNEL_1 );
+	//	Устанавливаем ранее заданное ослабление.
+	HAL_DAC_SetValue  ( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac [attenuator_ctrl] );
+}
+#endif	///	#if (DMS_DIP_ATTENUATOR_CONTROL==1)
+
+/**
+ *	@brief	Считывание текущего состояния переключатедей.
+ *	@retval	NONE.
+ */
+int dms_get_switch_state 				( void )
+{
+	int state = 0;
+	float frequency = DeviceCfg.CurrentFrequency;
+
+	state += ( HAL_GPIO_ReadPin ( DIP_SW0_GPIO_Port, DIP_SW0_Pin ) == GPIO_PIN_RESET ) ? 0 : 1;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW1_GPIO_Port, DIP_SW1_Pin ) == GPIO_PIN_RESET ) ? 0 : 2;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW2_GPIO_Port, DIP_SW2_Pin ) == GPIO_PIN_RESET ) ? 0 : 4;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW3_GPIO_Port, DIP_SW3_Pin ) == GPIO_PIN_RESET ) ? 0 : 8;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW4_GPIO_Port, DIP_SW4_Pin ) == GPIO_PIN_RESET ) ? 0 : 16;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW5_GPIO_Port, DIP_SW5_Pin ) == GPIO_PIN_RESET ) ? 0 : 32;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW6_GPIO_Port, DIP_SW6_Pin ) == GPIO_PIN_RESET ) ? 0 : 64;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW7_GPIO_Port, DIP_SW7_Pin ) == GPIO_PIN_RESET ) ? 0 : 128;
+
+	if ( DeviceCfg.Sweep.OnOff==0 )
+	{
+		switch (state)
+		{
+			case 1:
+				frequency = DeviceCfg.DipFrequency[0];
+				break;
+			case 2:
+				frequency = DeviceCfg.DipFrequency[1];
+				break;
+			case 4:
+				frequency = DeviceCfg.DipFrequency[2];
+				break;
+			case 8:
+				frequency = DeviceCfg.DipFrequency[3];
+				break;
+			case 16:
+				frequency = DeviceCfg.DipFrequency[4];
+				break;
+			case 32:
+				frequency = DeviceCfg.DipFrequency[5];
+				break;
+			case 64:
+				frequency = DeviceCfg.DipFrequency[6];
+				break;
+			case 128:
+				frequency = DeviceCfg.DipFrequency[7];
+				break;
+			default:
+				frequency = DeviceCfg.Sweep.BeginFrequency;
+		}
+
+		if ( DeviceCfg.CurrentFrequency!=frequency )
+		{
+			DeviceCfg.CurrentFrequency = frequency;
+			MAX2871_SetFrequency ( DeviceCfg.CurrentFrequency, 0 );
+		}
+	}
+	return state;
+}
+
+/**
+ * @brief	Функция инициализации структуры DeviceCfg.
+ * @param	Cfg - Указатель на структуру
+ * @retval	NONE.
+ */
+static void dms_init_configuration 		( tsDeviceCfg *Cfg )
+{
+	///	Настройка параметров работы со светодиодом:
+	Cfg->Led.Ctrl 						= 1;
+	Cfg->Led.Interval 					= 100;
+
+	///	Задание параметров свипа:
+	Cfg->CurrentFrequency 				= 2400000000.0; 			//	Частота по умолчанию.
+	Cfg->WaitLD 						= 1; 						//	Статус захвата частоты.
+	Cfg->RfOutState						= 1; 						//	Статус состояния выхода.
+	Cfg->Sweep.BeginFrequency			= MAX2871_GetFrequency ();	//	СЧитывание частоты.
+	Cfg->Sweep.StepFrequency			= 0.0;
+	Cfg->Sweep.Points 					= 1;
+	Cfg->Sweep.HoldTime 				= 0.000005;
+	Cfg->Attenuator.Dac[0] 				= 2048;
+
+	///	Настройка динамика.
+	Cfg->BuzzerCtrl 					= 0;
+
+	///	Настройка детектора.
+	Cfg->Detector.Ctrl					= 1;
+	Cfg->Detector.ReqVoltage			= 800;
+	Cfg->Detector.Voltage				= 0;
+
+	//	Настройка параметров DDS
+	Cfg->DDS							= &AD9106;
+	Cfg->DDS->begin = Cfg->DDS->current	= 5000000.0;
+	Cfg->DDS->sweep_ctrl				= 0;
+	Cfg->DDS->ctrl_freq					= 100000.0F;
+	Cfg->DDS->step						= 100000.0F;
+	Cfg->DDS->points					= 101;
+
+	Cfg->PulseModulator.Ctrl			= 0;
+	Cfg->PulseModulator.Frequency		= 0.0F;
+	Cfg->PulseModulator.DutyCycle		= 0.5F;
+
+	Cfg->DipFrequency[0] 				= 2500000000.0F;
+	Cfg->DipFrequency[1] 				= 2510000000.0F;
+	Cfg->DipFrequency[2] 				= 2520000000.0F;
+	Cfg->DipFrequency[3] 				= 2530000000.0F;
+	Cfg->DipFrequency[4] 				= 2540000000.0F;
+	Cfg->DipFrequency[5] 				= 2550000000.0F;
+	Cfg->DipFrequency[6] 				= 2560000000.0F;
+	Cfg->DipFrequency[7] 				= 2570000000.0F;
+}
+
+/**
+ *	@brief	Функция для считывания конфигурации устройства из внешней памяти.
+ *	@retval	Результат вычитывания конфигурации.
+ *			[0] - При считывании конфигурации произошла ошибка.
+ *			[1] - Считывания завершено успешно.
+ */
+static int dms_read_configuration 		( void )
+{
+	int 		result = 1;
+	int			status = 1;
+	uint16_t	crc = 0x0000;
+	uint8_t		data[128];
+
+	memset  ( DeviceInfo.SerialNumber, 0, (DMS_SERIAL_NUMBER_SIZE+2) );
+	memset  ( DeviceInfo.Date, 		   0, (DMS_DATE_SIZE+2) );
+
+	//	Чтение серийного номера и даты производства .
+	sprintf ( (char*)DeviceInfo.SerialNumber, "%s", (char*)"0000000002" );
+	sprintf ( (char*)DeviceInfo.Date, 		  "%s", (char*)"01012021"   );
+
+	result = AT24_I2C_MemoryRead ( EEPROM_SN_DESCRIPTION, data, DMS_SERIAL_NUMBER_SIZE + DMS_DATE_SIZE + 2 );
+	if (result == 1)
+	{
+		crc = CalculateCRC16 ( data, DMS_SERIAL_NUMBER_SIZE + DMS_DATE_SIZE );
+		if ( crc==*((unsigned short*) &data[DMS_SERIAL_NUMBER_SIZE + DMS_DATE_SIZE]) )
+		{
+			for ( int i=0; i<DMS_SERIAL_NUMBER_SIZE; i++ )
+			{
+				if ( data[i]>=0x30 && data[i]<=0x39 )
+					DeviceInfo.SerialNumber [i] = data [i];
+				else
+					DeviceInfo.SerialNumber [i] = 0x31;
+			}
+			for ( int i=0; i<DMS_DATE_SIZE; i++ )
+			{
+				DeviceInfo.Date [i] = data [DMS_SERIAL_NUMBER_SIZE + i];
+			}
+		}
+	}
+
+	//	Чтение настройки устройства.
+	result = AT24_I2C_MemoryRead ( EEPROM_DEV_CONFIGURATION, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 4*2 + 2*4 + 2 );
+		if (crc == *((unsigned short*) &data[16]))
+		{
+			DeviceCfg.Attenuator.Dac[0] = *((unsigned short*)&data[0]);
+			DeviceCfg.Attenuator.Dac[1] = *((unsigned short*)&data[2]);
+			DeviceCfg.Attenuator.Dac[2] = *((unsigned short*)&data[4]);
+			DeviceCfg.Attenuator.Dac[3] = *((unsigned short*)&data[6]);
+		}
+	}
+
+	//	Чтение конфигурационных регистров MAX2871 из I2C памяти.
+	result = AT24_I2C_MemoryRead ( EEPROM_PLL_INIT, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 24 );
+		if ( crc==*((unsigned short*)&data[24]) )
+		{
+			MAX2871_Register ( *((unsigned long*)&data[0])  );	// MAX2871_REG0
+			MAX2871_Register ( *((unsigned long*)&data[4])  );	// MAX2871_REG1
+			MAX2871_Register ( *((unsigned long*)&data[8])  );	// MAX2871_REG2
+			MAX2871_Register ( *((unsigned long*)&data[12]) );	// MAX2871_REG3
+			MAX2871_Register ( *((unsigned long*)&data[16]) );	// MAX2871_REG4
+			MAX2871_Register ( *((unsigned long*)&data[20]) );	// MAX2871_REG5
+		}
+	}
+
+	//	Чтение конфигурационных регистров MAX2871 из I2C памяти.
+	result = AT24_I2C_MemoryRead ( EEPROM_PLL_MODE, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 14 );
+		if ( crc==*((unsigned short*)&data[14]) )
+		{
+			DeviceCfg.WaitLD				= data[0];
+			DeviceCfg.Sweep.OnOff			= data[1];
+			DeviceCfg.Sweep.StepFrequency	= *((float*)&data[2]);
+			DeviceCfg.Sweep.Points 			= *((unsigned long*)&data[6]);
+			DeviceCfg.Sweep.HoldTime		= *((float*)&data[10]);
+			if ( DeviceCfg.Sweep.Points>10000 )
+			{
+				DeviceCfg.Sweep.Points=10000;
+			}
+		}
+	}
+
+	//	Чтение настроек DDS.
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_MODE, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 18 );
+		if ( crc==*((unsigned short*)&data[18]) )
+		{
+			DeviceCfg.DDS->sweep_ctrl	= *((unsigned short*)&data[0]);
+			DeviceCfg.DDS->begin 		= DeviceCfg.DDS->current = *((float*)&data[2]);
+			DeviceCfg.DDS->step			= *((float*)&data[6]);
+			DeviceCfg.DDS->points		= *((unsigned long*)&data[10]);
+			DeviceCfg.DDS->ctrl_freq	= *((float*)&data[14]);
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_REG_PART1, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 30 );
+		if ( crc==*((unsigned short*)&data[30]) )
+		{
+			for ( int i=0; i<15; i++ )
+			{
+				AD9106_SetRegister ( i, *((unsigned short*)&data[2*i]) );
+			}
+		}
+		else
+		{
+			status=2;
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_REG_PART2, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 30 );
+		if ( crc==*((unsigned short*)&data[30]) )
+		{
+			AD9106_SetRegister ( 30, *((unsigned short*)&data[0])  ); //  1
+			AD9106_SetRegister ( 31, *((unsigned short*)&data[2])  ); //  2
+			AD9106_SetRegister ( 32, *((unsigned short*)&data[4])  ); //  3
+			AD9106_SetRegister ( 34, *((unsigned short*)&data[6])  ); //  4
+			AD9106_SetRegister ( 35, *((unsigned short*)&data[8])  ); //  5
+			AD9106_SetRegister ( 36, *((unsigned short*)&data[10]) ); //  6
+			AD9106_SetRegister ( 37, *((unsigned short*)&data[12]) ); //  7
+			AD9106_SetRegister ( 38, *((unsigned short*)&data[14]) ); //  8
+			AD9106_SetRegister ( 39, *((unsigned short*)&data[16]) ); //  9
+			AD9106_SetRegister ( 40, *((unsigned short*)&data[18]) ); // 10
+			AD9106_SetRegister ( 41, *((unsigned short*)&data[20]) ); // 11
+			AD9106_SetRegister ( 42, *((unsigned short*)&data[22]) ); // 12
+			AD9106_SetRegister ( 43, *((unsigned short*)&data[24]) ); // 13
+			AD9106_SetRegister ( 44, *((unsigned short*)&data[26]) ); // 14
+			AD9106_SetRegister ( 45, *((unsigned short*)&data[28]) ); // 15
+		}
+		else
+		{
+			status=2;
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_REG_PART3, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 30 );
+		if ( crc==*((unsigned short*)&data[30]) )
+		{
+			AD9106_SetRegister ( 46, *((unsigned short*)&data[0])  ); //  1
+			AD9106_SetRegister ( 47, *((unsigned short*)&data[2])  ); //  2
+			AD9106_SetRegister ( 48, *((unsigned short*)&data[4])  ); //  3
+			AD9106_SetRegister ( 49, *((unsigned short*)&data[6])  ); //  4
+			AD9106_SetRegister ( 50, *((unsigned short*)&data[8])  ); //  5
+			AD9106_SetRegister ( 51, *((unsigned short*)&data[10]) ); //  6
+			AD9106_SetRegister ( 52, *((unsigned short*)&data[12]) ); //  7
+			AD9106_SetRegister ( 53, *((unsigned short*)&data[14]) ); //  8
+			AD9106_SetRegister ( 54, *((unsigned short*)&data[16]) ); //  9
+			AD9106_SetRegister ( 55, *((unsigned short*)&data[18]) ); // 10
+			AD9106_SetRegister ( 62, *((unsigned short*)&data[20]) ); // 11
+			AD9106_SetRegister ( 63, *((unsigned short*)&data[22]) ); // 12
+			AD9106_SetRegister ( 64, *((unsigned short*)&data[24]) ); // 13
+			AD9106_SetRegister ( 65, *((unsigned short*)&data[26]) ); // 14
+			AD9106_SetRegister ( 66, *((unsigned short*)&data[28]) ); // 15
+		}
+		else
+		{
+			status=2;
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_REG_PART4, data, 32 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 30 );
+		if ( crc==*((unsigned short*)&data[30]) )
+		{
+			AD9106_SetRegister ( 67, *((unsigned short*)&data[0])  ); //  1
+			AD9106_SetRegister ( 68, *((unsigned short*)&data[2])  ); //  2
+			AD9106_SetRegister ( 69, *((unsigned short*)&data[4])  ); //  3
+			AD9106_SetRegister ( 71, *((unsigned short*)&data[6])  ); //  4
+			AD9106_SetRegister ( 80, *((unsigned short*)&data[8])  ); //  5
+			AD9106_SetRegister ( 81, *((unsigned short*)&data[10]) ); //  6
+			AD9106_SetRegister ( 82, *((unsigned short*)&data[12]) ); //  7
+			AD9106_SetRegister ( 83, *((unsigned short*)&data[14]) ); //  8
+			AD9106_SetRegister ( 84, *((unsigned short*)&data[16]) ); //  9
+			AD9106_SetRegister ( 85, *((unsigned short*)&data[18]) ); // 10
+			AD9106_SetRegister ( 86, *((unsigned short*)&data[20]) ); // 11
+			AD9106_SetRegister ( 87, *((unsigned short*)&data[22]) ); // 12
+			AD9106_SetRegister ( 88, *((unsigned short*)&data[24]) ); // 13
+			AD9106_SetRegister ( 89, *((unsigned short*)&data[26]) ); // 14
+			AD9106_SetRegister ( 90, *((unsigned short*)&data[28]) ); // 15
+		}
+		else
+		{
+			status=2;
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_DDS_REG_PART5, data, 12 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 10 );
+		if ( crc==*((unsigned short*)&data[10]) )
+		{
+			AD9106_SetRegister ( 91, *((unsigned short*)&data[0]) ); // 1
+			AD9106_SetRegister ( 92, *((unsigned short*)&data[2]) ); // 2
+			AD9106_SetRegister ( 93, *((unsigned short*)&data[4]) ); // 3
+			AD9106_SetRegister ( 94, *((unsigned short*)&data[6]) ); // 4
+			AD9106_SetRegister ( 95, *((unsigned short*)&data[8]) ); // 5
+		}
+		else
+		{
+			status=2;
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_LO_SWITCH_PART1, data, 4*4+2 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 4*4 );
+		if ( crc==*((unsigned short*)&data[4*4]) )
+		{
+			for ( int i=0; i<4; i++ )
+			{
+				DeviceCfg.DipFrequency[i] = *((float*)&data[4*i]);
+			}
+		}
+	}
+
+	result = AT24_I2C_MemoryRead ( EEPROM_LO_SWITCH_PART2, data, 4*4+2 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 4*4 );
+		if ( crc==*((unsigned short*)&data[4*4]) )
+		{
+			for ( int i=0; i<4; i++ )
+			{
+				DeviceCfg.DipFrequency[4+i] = *((float*)&data[4*i]);
+			}
+		}
+	}
+
+	return status;
+}
+
+/**
+ *  @brief	Функция отправки ответа.
+ *  @param	Buf: Указатель на данные.
+ *  @param	Len: Размер данных.
+ *  @retval	NONE
+ */
+static void dms_send_answer				( uint8_t* Buf, uint16_t Len )
+{
+	for ( int i=0; i<Len; i++ )
+	{
+		usb_tx_buff[usb_tx_counter + i] = Buf[i];
+	}
+	usb_tx_counter += Len;
+}
+
+/**
+ *  @brief	Обработка принятой команды.
+ *  @param	Buf - Указатель на массив с принятыми данными.
+ *  @retval	Статус о завершении ошибки.
+ */
+static int dms_decode_receive_command	( uint8_t* Buf )
+{
+	uint8_t answer[SYSCOM_SIZE];
+	tsSysCmd* pRxCmd = (tsSysCmd*)Buf;
+	tsSysCmd* pTxCmd = (tsSysCmd*)answer;
+	int iParameter;
+
+	memset ( answer, 0, SYSCOM_SIZE );
+
+	pTxCmd->Type   = pRxCmd->Type;
+	pTxCmd->Status = CMD_DONE;
+
+	switch ( pRxCmd->Type )
+	{
+		case TEST_CONNECT:	//{ Тестовая команда.
+			break;	//}
+
+		case DEFAULT:	//{ Настройка устройства по умолчанию
+			dms_read_configuration ();
+			dms_init ();	
+			break;	//}
+
+		case GET_VERSIONS:	//{	Команда считывания версии платы и микропрограммы.
+			pTxCmd->Len 	= 4;
+			pTxCmd->data[0]	= 0;
+			pTxCmd->data[1]	= HARDWARE_VERSION;
+			pTxCmd->data[2]	= FIRMWARE_VERSION_MINOR;
+			pTxCmd->data[3]	= FIRMWARE_VERSION_MAJOR;
+			break;	//}
+
+		case GET_STATE:	//{
+			pTxCmd->Len 	= 6;
+			pTxCmd->data[0]	= ( pTxCmd->data[0]&0xFE ) + MAX2871_GetMuxOut ( );	   // MUXOUT
+			pTxCmd->data[0]	= ( pTxCmd->data[0]&0xFD ) + ( MAX2871_GetLD ( )<<1 ); // LOCK DETECT
+			pTxCmd->data[1]	= 0x00;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Attenuator.Dac[0];
+			*((uint16_t*)&pTxCmd->data[4]) = dms_get_switch_state ();
+			break;	//}
+
+		case SET_CTRL_POWER_DET:	//{	Задание предельного уровня мощности.
+			if ( pRxCmd->Len==4 ) 
+			{
+				DeviceCfg.Detector.Ctrl 	  = *((uint16_t*)&pRxCmd->data[0]);
+				DeviceCfg.Detector.ReqVoltage = *((uint16_t*)&pRxCmd->data[2]);
+			} 
+			else 
+			{
+				pTxCmd->Status = CMD_RECV_CMD_ERROR;
+			}
+			break;	//}
+
+		case GET_CTRL_POWER_DET:	//{	Считывание состояния детектора.
+			pTxCmd->Len = 6;
+			*((uint16_t*)&pTxCmd->data[0]) = DeviceCfg.Detector.Ctrl;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Detector.ReqVoltage;
+			*((uint16_t*)&pTxCmd->data[4]) = DeviceCfg.Detector.Voltage;
+			break;	//}
+
+		case SET_DAC_VALUE:			//{	Установка значения ЦАП.
+			if ( pRxCmd->Len>=4 )
+			{
+				//	Флаг управления аттенюатором
+				DeviceCfg.Attenuator.Ctrl	= *((uint16_t*)&pRxCmd->data[0]);
+				//	Значение ЦАП
+				DeviceCfg.Attenuator.Dac[0]	= *((uint16_t*)&pRxCmd->data[2]);
+				//	Запуск ЦАП, установка предыдущего напряжения.
+				HAL_DAC_Start 	 ( &hdac, DAC1_CHANNEL_1 );
+				//	Устанавливаем ранее заданное ослабление.
+				HAL_DAC_SetValue ( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac[0] );
+			}
+			break;	//}
+
+		case GET_DAC_VALUE:			//{	Считывание значения аттенюатора.
+			pTxCmd->Len = 4;
+			*((uint16_t*)&pTxCmd->data[0]) = DeviceCfg.Attenuator.Ctrl;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Attenuator.Dac[0];
+			break;	//}
+
+		case SET_SWEEP_PLL:			//{ Установка параметров свипа.
+			if ( pRxCmd->Len>=18 )
+			{
+				DeviceCfg.Sweep.BeginFrequency = *((float*)&pRxCmd->data[0]);
+				DeviceCfg.Sweep.StepFrequency  = *((float*)&pRxCmd->data[4]);
+				DeviceCfg.Sweep.Points 		   = *((uint32_t*)&pRxCmd->data[8]);
+				DeviceCfg.Sweep.HoldTime   	   = *((float*)&pRxCmd->data[12]);
+				DeviceCfg.WaitLD 		   	   = *((uint8_t*)&pRxCmd->data[16]);
+				DeviceCfg.Sweep.OnOff 		   = *((uint8_t*)&pRxCmd->data[17]);
+				DeviceCfg.CurrentFrequency 	   = DeviceCfg.Sweep.BeginFrequency;
+				MAX2871_SetFrequency ( DeviceCfg.Sweep.BeginFrequency, DeviceCfg.WaitLD );
+			}
+			break;	//}
+
+		case GET_SWEEP_PLL:			//{	Считывание параметров свипа.
+			pTxCmd->Len = 18;
+			*((float*)&pTxCmd->data[0])	   = DeviceCfg.Sweep.BeginFrequency;
+			*((float*)&pTxCmd->data[4])	   = DeviceCfg.Sweep.StepFrequency;
+			*((uint32_t*)&pTxCmd->data[8]) = DeviceCfg.Sweep.Points;
+			*((float*)&pTxCmd->data[12])   = DeviceCfg.Sweep.HoldTime;
+			*((uint8_t*)&pTxCmd->data[16]) = DeviceCfg.WaitLD;
+			*((uint8_t*)&pTxCmd->data[17]) = DeviceCfg.Sweep.OnOff;
+			break;	//}
+
+		case SET_SWEEP_DDS:
+			if ( pRxCmd->Len==2+4+4+4 )
+			{
+				DeviceCfg.DDS->sweep_ctrl = *((unsigned short*)&pRxCmd->data[0]);
+				DeviceCfg.DDS->begin	  = *((float*)&pRxCmd->data[2]);
+				DeviceCfg.DDS->step		  = *((float*)&pRxCmd->data[6]);
+				DeviceCfg.DDS->points	  = *((unsigned long*)&pRxCmd->data[10]);
+				AD9106_SetFrequency ( DeviceCfg.DDS->begin );
+			}
+			break;
+
+		case GET_SWEEP_DDS:		//{	Read parameters of sweep DDS
+			pTxCmd->Len = 2+4+4+4;
+			*((uint16_t*)&pTxCmd->data[0])  = DeviceCfg.DDS->sweep_ctrl;
+			*((float*)&pTxCmd->data[2])  	= DeviceCfg.DDS->begin;
+			*((float*)&pTxCmd->data[6])  	= DeviceCfg.DDS->step;
+			*((uint32_t*)&pTxCmd->data[10]) = DeviceCfg.DDS->points;
+			break;	//}
+
+		case SET_DDS_REG:	//{
+			//	Структура принятой команды:
+			//	0..1 - Адрес.
+			//	2..3 - Регистр.
+			if ( pRxCmd->Len==4 )
+			{
+				//	Запись регистра DDS с сохранением внутреннем буфере.
+				AD9106_WriteRegister ( *((uint16_t*)&pRxCmd->data[2]), *((uint16_t*)&pRxCmd->data[0]) );
+			}
+			break;	//}
+
+		case GET_DDS_REG:	//{
+			if ( pRxCmd->Len==2 )
+			{
+				pTxCmd->Len = 4;
+				*((uint16_t*)&pTxCmd->data[0]) = *((uint16_t*)&pRxCmd->data[0]);
+				*((uint16_t*)&pTxCmd->data[2]) = AD9106_GetRegister ( *((uint16_t*)&pRxCmd->data[0]) );
+			}
+			break;	//}
+
+		case GET_RAMP_DDS:	//{
+			break;	//}
+
+		case SET_RAMP_DDS:	//{
+			if ( pRxCmd->Len==4 )
+			{
+				AD9106_RampConfig_WriteToMemory (*((uint16_t*)&pRxCmd->data[0]),*((uint16_t*)&pRxCmd->data[2]));
+			}
+			break;	//}
+
+		case RESET_DDS:		//{
+			//	Инициализация микросхемы AD9106:
+			HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_RESET );
+			for (int i=0; i<100000; i++) {}
+			HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_SET );
+			for (int i=0; i<100000; i++) {}
+			AD9106_Init		  		( );
+			break;	//}
+
+		case READ_MEMORY:	//{ Read data from I2C memory
+			if ( pRxCmd->Len==4 ) 
+			{
+				pTxCmd->Len = (*((uint16_t*)&pRxCmd->data[2])+4);
+				*((uint16_t*)&pTxCmd->data[0]) = *((uint16_t*)&pRxCmd->data[0]);	//	Копирование в ответ адрес считывания.
+				*((uint16_t*)&pTxCmd->data[2]) = *((uint16_t*)&pRxCmd->data[2]);	//	Копирование в ответ кол-ва считанных данных.
+				iParameter = AT24_I2C_MemoryRead (
+						*((int16_t*)&pRxCmd->data[0]),	  // Адрес для чтения данных.
+						(uint8_t*)&pTxCmd->data[4],		  // Указатель на массив для сохранения данных из памяти.
+						*((uint16_t*)&pRxCmd->data[2]) ); // Кол-во данных для чтения.
+				if ( iParameter==-1 ) 
+				{
+					pTxCmd->Status = CMD_READ_EEPROM_ERROR;
+				}
+				else if ( iParameter==-2 ) 
+				{
+					pTxCmd->Status = CMD_EEPROM_BUSY;
+				}
+			}
+			else 
+			{
+				pRxCmd->Status = CMD_RECV_CMD_ERROR;
+			}
+			break;	//}
+
+		case WRITE_MEMORY:			//{ Write data to I2C memory.
+			if ( pRxCmd->Len>=4 )
+			{
+				iParameter = AT24_I2C_MemoryWrite (
+						*((int16_t*)&pRxCmd->data[0]), 	 //	Адрес для записи данных.
+						((uint8_t*)&pRxCmd->data[4]), 	 //	Указатель на массив данных для записи.
+						*((int16_t*)&pRxCmd->data[2]) ); //	Кол-во данных для записи.
+				if ( iParameter!=-1 )
+				{
+					pTxCmd->Status = CMD_WRITE_EEPROM_ERROR;
+				}
+				else if ( iParameter==-2 )
+				{
+					pTxCmd->Status = CMD_EEPROM_BUSY;
+				}
+			}
+			else
+			{
+				pRxCmd->Status = CMD_RECV_CMD_ERROR;
+			}
+			break;	//}
+
+		case SET_PULSE_CTRL:	//{
+			if ( pRxCmd->Len>=10 )
+			{
+				DeviceCfg.PulseModulator.Ctrl		= *((uint16_t*)&pRxCmd->data[0]);
+				DeviceCfg.PulseModulator.Frequency	= *((float*)&pRxCmd->data[2]);
+				DeviceCfg.PulseModulator.DutyCycle	= *((float*)&pRxCmd->data[6]);
+				//	Управление импульсным модулятором:
+				pulse_timer_ctrl ( &htim2, TIM_CHANNEL_4,
+								   ( DeviceCfg.PulseModulator.Ctrl>0 ) ? PULSE_TIMER_ON : PULSE_TIMER_OFF,
+								   DeviceCfg.PulseModulator.Frequency,
+								   DeviceCfg.PulseModulator.DutyCycle );
+			}
+			break;	//}
+
+		case GET_PULSE_CTRL:	//{
+			pTxCmd->Len = 6;
+			*((uint16_t*)&pTxCmd->data[0])	= DeviceCfg.PulseModulator.Ctrl;
+			*((float*)&pTxCmd->data[2])		= DeviceCfg.PulseModulator.Frequency;
+			*((float*)&pTxCmd->data[6])		= DeviceCfg.PulseModulator.DutyCycle;
+			break;	//}
+
+		case SET_DDS_CTR_FREQ:	//{	Частота управления DDS
+			if ( pRxCmd->Len==4 )
+			{
+				DeviceCfg.DDS->ctrl_freq = *((float*)&pRxCmd->data[0]);
+				dms_dds_ctrl_config ( ( DeviceCfg.DDS->ctrl_freq>0 )?1:0 );
+				pulse_timer_ctrl ( &htim4, TIM_CHANNEL_3,
+								   ( DeviceCfg.DDS->ctrl_freq>0 ) ? PULSE_TIMER_ON : PULSE_TIMER_OFF,
+								   DeviceCfg.DDS->ctrl_freq,
+								   0.02 );
+				if ( DeviceCfg.DDS->ctrl_freq==0 )
+				{
+					HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_RESET );
+					for ( int i=0; i<10000; i++ ) {}
+					HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_SET );
+					for ( int i=0; i<10000; i++ ) {}
+					HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_RESET );
+				}
+			}
+			break;	//}
+
+		case GET_DDS_CTR_FREQ:	//	Считывание частоты управления DDS.
+			pTxCmd->Len = 4;
+			*((float*)&pTxCmd->data[0]) = DeviceCfg.DDS->ctrl_freq;
+			break;
+
+		case SET_PLL_REG:			//{	Запись регистра ФАПЧ.
+			if ( pRxCmd->Len==4 ) 
+			{
+				MAX2871_SetRegister ( *((unsigned long*)&pRxCmd->data[0]) );
+			}
+			break;	//}
+
+		case GET_PLL_REG:			//{	Считывание регистра ФАПЧ.
+			if (pRxCmd->Len >= 2) 
+			{
+				iParameter	= *((int*)&pRxCmd->data[0]);
+				pTxCmd->Len = 4;
+				*((unsigned long*)&pTxCmd->data[0]) = MAX2871_GetRegister ( iParameter );
+			}
+			break;	//}
+
+		default:
+			pTxCmd->Status = CMD_UNDEFINED;
+			break;
+	}
+
+	dms_send_answer ( answer, SYSCOM_SIZE );
+
+	return 0;
+}
+
+/**
+ * @brief	Расчет следующей частоты СЧ гетеродина.
+ * @retval	NONE
+ */
+void dms_calc_frequency					( void )
+{
+	float fEndFreq = (((float)DeviceCfg.Sweep.Points)-1.0F);
+
+	fEndFreq = DeviceCfg.Sweep.BeginFrequency + (float)(fEndFreq * DeviceCfg.Sweep.StepFrequency);
+
+	DeviceCfg.CurrentFrequency += DeviceCfg.Sweep.StepFrequency;
+	if ( DeviceCfg.CurrentFrequency>fEndFreq )
+	{
+		DeviceCfg.CurrentFrequency = DeviceCfg.Sweep.BeginFrequency;
+	}
+}
+
+/**
+ * @brief	Команда вызываемая для сохранения данных получаемых через USB.
+ * @param	Buf - Указатель на массив с принятыми данными.
+ * @param	Len - Кол-во принятых данных.
+ * @retval	NONE
+ */
+uint8_t dms_recv_bulk_data				( uint8_t *Buf, uint16_t *Len )
+{
+	for ( uint16_t i=0; i<*Len; i++ )
+	{
+		usb_rx_buff[usb_rx_counter+i] = Buf[i];
+	}
+	usb_rx_counter+=*Len;
+	return 0;
+}
+
+/**
+ *	@brief	Функция инициализации устройства.
+ *	@retval	0 - Данная функция всегда возвращяет 0.
+ */
+int dms_init							( void )
+{
+	int result=0;
+
+	dms_thread1_index 	= 0;
+	dms_thread1_size  	= sizeof(dms_thread1_funcs)/4;
+
+	dms_thread2_index 	= 0;
+	dms_thread2_size  	= sizeof(dms_thread2_funcs)/4;
+
+	usb_rx_counter		= 0;
+	memset ( usb_rx_buff, 0, 256 );
+
+	usb_tx_counter		= 0;
+	memset ( usb_tx_buff, 0, 256 );
+
+	dms_led_counter		= 0;
+
+	HAL_GPIO_WritePin 		( LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET   );
+	HAL_GPIO_WritePin 		( LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET );
+
+	//	НАСТРОЙКА ПЕРИФЕРИИ:
+	//	Запуск ЦАП, установка предыдущего напряжения:
+	HAL_DAC_Start 	  		( &hdac, DAC1_CHANNEL_1 );
+	//	Устанавливаем максимальное ослабление:
+	HAL_DAC_SetValue  		( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 4095 );
+
+	//	Настройка библиотеки для работы с I2C памятью:
+	AT24_I2C_SetPeriph		( &hi2c1 );
+
+	//	Инициализация структуры с конфигурацией устройства:
+	dms_init_configuration	( &DeviceCfg );
+
+	//	Чтение конфигурации устройства:
+	result = dms_read_configuration	( );
+
+#if DMS_USE_AD5932==1
+	//	Задание переферии необходимой для работы с AD5932:
+	AD5932_SetPeriph  		( DDS_FSYNC_GPIO_Port, DDS_FSYNC_Pin, DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, DDS_INTERRUPT_GPIO_Port, DDS_INTERRUPT_Pin, &hspi3 );
+	//	Инициализация микросхемы AD5932:
+	AD5932_Init		  		( );
+#else
+	HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_RESET );
+	//	Настройка периферии для работы с AD9106:
+	AD9106_SetPeriph		( &hspi3,
+							  DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin,
+							  DDS_CTRL_GPIO_Port, 	 DDS_CTRL_Pin,
+							  DDS_FSYNC_GPIO_Port, 	 DDS_FSYNC_Pin );
+	//	Инициализация микросхемы AD9106:
+	HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_SET );
+
+	DdsTimer.hTim			= &htim5;
+	DdsTimer.pStatus		= (int*)timer5_status;
+	DdsTimer.pTimerCnt		= (uint32_t*)timer5_cnt;
+	DdsTimer.pTimerIrq		= (uint32_t*)timer5_irq;
+	action_timer_init 		( &DdsTimer, 0 );
+
+	//	Инициализация памяти DDS AD9106:
+	AD9106_RampConfig_WriteToMemory (4095,4096);
+
+	if ( result==2 ) 
+	{
+		AD9106_Default      ( );
+		dms_dds_ctrl_config ( ( DeviceCfg.DDS->ctrl_freq>0 )?1:0 );
+		pulse_timer_ctrl    ( &htim4, TIM_CHANNEL_3, ( DeviceCfg.DDS->ctrl_freq>0 ) ? PULSE_TIMER_ON : PULSE_TIMER_OFF, DeviceCfg.DDS->ctrl_freq, 0.02 );
+		AD9106_SetFrequency ( DeviceCfg.DDS->begin );
+	}
+	else 
+	{
+		DeviceCfg.Sweep.BeginFrequency = DeviceCfg.CurrentFrequency = MAX2871_GetFrequency ();
+		if ( DeviceCfg.DDS->sweep_ctrl==AD9106_RAMP ) 
+		{
+			AD9106_Init ( );
+			dms_dds_ctrl_config ( 1 );
+			pulse_timer_ctrl ( &htim4, TIM_CHANNEL_3, PULSE_TIMER_ON, 100, 0.1 );
+			HAL_Delay ( 100 );
+			dms_dds_ctrl_config ( 0 );
+			pulse_timer_ctrl ( &htim4, TIM_CHANNEL_3, PULSE_TIMER_OFF, 0, 0 );
+
+			HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_RESET );
+			for ( int i=0; i<10000; i++ ) {}
+			HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_SET );
+			for ( int i=0; i<10000; i++ ) {}
+			HAL_GPIO_WritePin ( DDS_CTRL_GPIO_Port, DDS_CTRL_Pin, GPIO_PIN_RESET );
+		}
+		else
+		{
+			AD9106_Init ( );
+			//	Инициализация таймера, для управления DDS.
+			dms_dds_ctrl_config ( ( DeviceCfg.DDS->ctrl_freq>0 )?1:0 );
+			pulse_timer_ctrl ( &htim4, TIM_CHANNEL_3, ( DeviceCfg.DDS->ctrl_freq>0 ) ? PULSE_TIMER_ON : PULSE_TIMER_OFF, DeviceCfg.DDS->ctrl_freq, 0.02 );
+			//	Установка начальной частоты DDS.
+			AD9106_SetFrequency ( DeviceCfg.DDS->begin );
+		}
+	}
+#endif	///	DMS_USE_AD5932
+
+	//	Запуск ЦАП, установка предыдущего напряжения:
+	HAL_DAC_Start 	  		( &hdac, DAC1_CHANNEL_1 );
+	//	Устанавливаем максимальное ослабление:
+	HAL_DAC_SetValue  		( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac[0] );
+
+	//	Задание переферии необходимой для работы с MAX2871:
+	MAX2871_SetPeriph 		( PLL_LE_GPIO_Port, PLL_LE_Pin, PLL_LD_GPIO_Port, PLL_LD_Pin, PLL_MUXOUT_GPIO_Port, PLL_MUXOUT_Pin, &hspi2 );
+	//	Инициализация микросхемы MAX2871:
+	MAX2871_Init 			( );
+	//	Установка частоты MAX2871:
+	MAX2871_SetFrequency 	( DeviceCfg.CurrentFrequency, 0 );
+
+	return 0;
+}
+
+/** 
+ *	@brief	
+ *	@param	time - Время работы таймера
+ *	@retval	NONE
+ */
+void dms_sweep_timer_start 				( float time )
+{
+	sweep_timer_start ( &htim3, time );
+}
+
+/** 
+ *	@brief	Остановка таймера.
+ *	@param	NONE
+ *	@retval	NONE
+ */
+void dms_sweep_timer_stop 				( void )
+{
+	sweep_timer_stop ( &htim3 );
+}
+
+/****************************************************************************
+ *					THREAD FUNCTIONS										*
+ ****************************************************************************/
+/****************************************************************************
+ *			SERVICE FUNCTIONS OF THE THREADS								*
+ ****************************************************************************/
+/**
+ *	@brief	Функция установки следующего этапа потока.
+ *	@retval	NONE.
+ */
+static void dms_thread1_next_func		( void )
+{
+	dms_thread1_index++;
+	if ( dms_thread1_index>=dms_thread1_size )
+	{
+		dms_thread1_index = 0;
+	}
+}
+
+/**
+ *	@brief	Функция установки следующего этапа потока.
+ *	@retval	NONE.
+ */
+static void dms_thread2_next_func		( void )
+{
+	dms_thread2_index++;
+	if ( dms_thread2_index>=dms_thread2_size )
+	{
+		dms_thread2_index = 0;
+	}
+}
+
+/****************************************************************************
+ *						THREAD 1											*
+ ****************************************************************************/
+/**
+ * @brief	Проверка принимаемых данных.
+ * @retval	NONE
+ */
+static void dms_check_recv_data			( void )
+{
+	if ( usb_rx_counter>=SYSCOM_SIZE )
+	{
+		dms_decode_receive_command (usb_rx_buff);
+		usb_rx_counter-=SYSCOM_SIZE;
+		for ( int i=0; i<usb_rx_counter; i++ )
+		{
+			usb_rx_buff[i] = usb_rx_buff[i+SYSCOM_SIZE];
+		}
+	}
+	dms_thread1_next_func ( );
+}
+
+/**
+ * @brief	Функция передачи данных.
+ * @retval	NONE
+ */
+static void dms_send_data 				( void )
+{
+	if ( usb_tx_counter>=SYSCOM_SIZE )
+	{
+		USBD_BULK_TransmitData ( &hUsbDeviceFS, usb_tx_buff, SYSCOM_SIZE );
+		usb_tx_counter-=SYSCOM_SIZE;
+		for ( int i=0; i<usb_tx_counter; i++ )
+		{
+			usb_tx_buff[i] = usb_tx_buff[i+SYSCOM_SIZE];
+		}
+	}
+	dms_thread1_next_func ( );
+}
+
+/**
+ * @brief	Управление росчерком ДДС.
+ * @retval	NONE
+ */
+static void dms_dds_control				( void )
+{
+	if ( DeviceCfg.DDS->sweep_ctrl==AD9106_SOFTWARE )
+	{
+		float cur_dds = AD9106_CurrentFrequency ();
+		float end_dds = DeviceCfg.DDS->begin + (float)(((float)(DeviceCfg.DDS->points-1))*DeviceCfg.DDS->step);
+
+		cur_dds = cur_dds + DeviceCfg.DDS->step;
+		if ( cur_dds>end_dds )
+		{
+			cur_dds = DeviceCfg.DDS->begin;
+		}
+		AD9106_SetFrequency (cur_dds);
+	}
+	dms_thread1_next_func ( );	
+}
+
+/****************************************************************************
+ *						THREAD 2											*
+ ****************************************************************************/
+/**
+ * @brief	Функция моргания светодиодом.
+ * @retval	NONE
+ */
+static void dms_led_blinking 			( void )
+{
+	if ( DeviceCfg.Led.Ctrl==1 )
+	{
+		if ( dms_led_counter>(DeviceCfg.Led.Interval*1000) )
+		{
+			dms_led_counter=0;
+			HAL_GPIO_TogglePin ( LED2_GPIO_Port, LED2_Pin );
+			HAL_GPIO_TogglePin ( LED3_GPIO_Port, LED3_Pin );
+		}
+		else
+		{
+			dms_led_counter++;
+		}
+	}
+	else
+	{
+		HAL_GPIO_WritePin ( LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET   );
+		HAL_GPIO_WritePin ( LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET );
+	}
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Проверка состояния переключателей.
+ * @retval	NONE
+ */
+static void dms_check_switch_state		( void )
+{
+	//	Read current state of switches.
+	int switch_state = 0;
+
+	switch_state = dms_get_switch_state ();
+
+#if (DMS_DIP_ATTENUATOR_CONTROL==1)
+	dms_attenuator_control ( (int)((switch_state>>4)&0x0F) );
+#endif	//	DMS_DIP_ATTENUATOR_CONTROL
+
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Измерение напряжения на входе детектора мощности.
+ * @retval	NONE
+ */
+static void dms_check_detector_voltage	( void )
+{
+	DeviceCfg.Detector.Voltage = detector_measure ( DeviceCfg.Detector.Ctrl );
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Функция перестройки частоты гетеродина.
+ * @retval	NONE.
+ */
+static void dms_sweep_lo 				( void )
+{
+	if ( DeviceCfg.Sweep.Points>1 && DeviceCfg.Sweep.StepFrequency!=0 )
+	{
+		if ( ( DeviceCfg.WaitLD==1 ) && ( MAX2871_GetLD()==0 ) )
+		{
+			if ( dms_pll_wait_cnt>1000000000 )
+			{
+				dms_pll_wait_cnt = 0;
+				MAX2871_SetFrequency ( DeviceCfg.CurrentFrequency, 0 );
+			}
+			else
+			{
+				dms_pll_wait_cnt++;
+			}
+		}
+		else
+		{
+			if ( get_sweep_timer_status()==1 )
+			{
+				if ( sweep_timer_state()>2 )
+				{
+					dms_pll_wait_cnt = 0;
+					dms_sweep_timer_stop ( );
+					dms_calc_frequency ( );
+					MAX2871_SetFrequency ( DeviceCfg.CurrentFrequency, 0 );
+				}
+			}
+			else
+			{
+				dms_sweep_timer_start ( DeviceCfg.Sweep.HoldTime );
+			}
+		}
+	}
+	dms_thread2_next_func ( );
+}
+
+/****************************************************************************
+ *					MAIN THREAD FUNCTION									*
+ ****************************************************************************/
+/**
+ * @brief	Главная функция управления потоками.
+ * @retval	NONE
+ */
+void dms_thread_func 					( void )
+{
+	//	Поток №1
+	dms_thread1_funcs[dms_thread1_index]( );
+
+	//	Поток №2
+	dms_thread2_funcs[dms_thread2_index]( );
+}
+
+/********************  END OF FILE  *****************************************/

@@ -1,0 +1,84 @@
+# Build artifacts
+*.o
+*.a
+*.lib
+*.so
+*.exe
+*.dll
+*.elf
+*.hex
+*.bin
+
+# STM32CubeMX
+STM32CubeMX/
+
+# Visual Studio / Visual Studio Code
+.vs/
+.vscode/
+*.sln.DotSettings
+*.user
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+.VisualStudio/
+
+# Build directories
+build/
+cmake_build/
+_build/
+
+# Object files
+*.o
+*.a
+*.lib
+
+# Executable files
+*.exe
+*.out
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+.directory
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Compiler output
+*.d
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node modules (if using web tools)
+node_modules/
+npm-debug.log
+
+# Environment files
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+
+# milestones backups folder
+milestones backups/

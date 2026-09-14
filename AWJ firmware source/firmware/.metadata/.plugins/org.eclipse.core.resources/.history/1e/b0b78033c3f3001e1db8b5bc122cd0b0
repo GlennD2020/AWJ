@@ -1,0 +1,163 @@
+/**
+ * @file: 		dms_project.h
+ * @project: 	DMS synthesizer
+ * @date: 		14/12/2020
+ * @author:		Kirillov A.V.
+ */
+#ifndef __H_DMS_DEVICE_
+#define __H_DMS_DEVICE_
+
+/****************************************************************************
+ *						INCLUDES											*
+ ****************************************************************************/
+#ifdef STM32F446xx
+	#include "stm32f4xx_hal.h"
+#endif	//	STM32F446xx
+
+#ifdef STM32F205xx
+	#include "stm32f2xx_hal.h"
+#endif	//	STM32F205xx
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "ad9106.h"
+
+/****************************************************************************
+ *						PROJECT DEFINES										*
+ ****************************************************************************/
+#define _DMS_
+
+#define HARDWARE_VERSION 			4
+
+#define FIRMWARE_VERSION_MAJOR		3
+#define FIRMWARE_VERSION_MINOR		3
+
+#define DMS_ROTARY_SWITCH			1
+#define DMS_DIP_ATTENUATOR_CONTROL	0
+#define DMS_USE_AD5932				0
+#define DMS_USE_AD9106				1
+
+#define USB_USE_VCP					0
+#define USB_USE_BULK				1
+
+#define DMS_ADC_SIZE_BUFF			256
+#define DMS_ADC_AVERAGE_DEFAULT		128
+#define DMS_ADC_AVERAGE_SWEEP		32
+
+/****************************************************************************
+ *						EEPROM ADDRESS MAP									*
+ ****************************************************************************/
+#define EEPROM_SN_DESCRIPTION		0		//<	Серийный номер.
+#define EEPROM_DEV_CONFIGURATION	32		//<	Конфигурация устройства.
+#define EEPROM_PLL_INIT				64		//<	Адрес регистров инициализации микросхемы PLL.
+#define EEPROM_PLL_MODE				96		//< Настройка режиме работы PLL.
+#define EEPROM_DDS_MODE				128 	//< Настройка режима работы DDS.
+#define EEPROM_DDS_REG_PART1		160 	//<
+#define EEPROM_DDS_REG_PART2		192 	//<
+#define EEPROM_DDS_REG_PART3		224 	//<
+#define EEPROM_DDS_REG_PART4		256 	//<
+#define EEPROM_DDS_REG_PART5		288 	//<
+#define EEPROM_DDS_RAMP_CFG			320 	//<
+#define EEPROM_LO_SWITCH_PART1		352 	//<
+#define EEPROM_LO_SWITCH_PART2		384 	//<
+
+/****************************************************************************
+ *						SIZE DATA BLOCK IN EEPROM							*
+ ****************************************************************************/
+#define DMS_SERIAL_NUMBER_SIZE		10		//<	Размер серийного номера.
+#define DMS_DATE_SIZE				8 		//<	Дата производства.
+
+/****************************************************************************
+ *						TYPEDEF STRUCTS										*
+ ****************************************************************************/
+/**
+ *	@brief	Структура с параметра частотного росчерка LO (MAX2871).
+ */
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			OnOff;				//< [0/1] - Управление росчерком.
+	uint16_t			Power;				//<	Код мощности СЧ.
+	uint32_t			Points;				//<	Количество точек.
+	float 				BeginFrequency; 	//<	Начальная частота росчерка.
+	float 				StepFrequency;		//<	Шаг росчерка.
+	float 				HoldTime;			//<	Время удержания.
+} tsSweepParameters;
+#pragma pack(pop)
+
+/**
+ *	@brief Структура для управления аттенюатором
+ */
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			Ctrl;				//< Управление аттенюатором:
+											//<	[0] - Управляющее напряжение которое не зависит от состояния ключей.
+											//<	[1] - Управляющее напряжение задается из памяти устройства в зависимости от состояния ключей
+	uint16_t			Dac;				//<	Значение цап не зависимое от состояние ключей.
+	uint16_t			DipDac[16]; 		//< Массив значений ЦАП переключателей.
+} tsAttenuator;
+#pragma pack(pop)
+
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			Ctrl;				//<	[0/1] - Управление считыванием детектора напряжения.
+	uint16_t			ReqVoltage; 		//<	Требуемое напряжение на выходе детектора.
+	uint16_t			Voltage;			//<	Результат считывания напряжения на выходе детектора.
+} tsDetector;
+#pragma pack(pop)
+
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			Ctrl;				//< [0/1] - Управление состоянием светодиода.
+	uint32_t			Interval;			//<	Интервал изменения состояния.
+} tsLedCtrl;
+#pragma pack(pop)
+
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			Ctrl;				//< [0/1] - Управление состоянием светодиода.
+	float				Frequency;			//<	Интервал изменения состояния.
+	float				DutyCycle;			//<	[0...1] Скважность.
+} tsPulseModulator;
+#pragma pack(pop)
+
+/**
+ *	@brief	Конфигурация устройства.
+ */
+#pragma pack(push,1)
+typedef struct
+{
+	uint16_t			RfOutState;			//<	[0/1] - Управление выходом прибора.
+	uint16_t 			BuzzerCtrl;			//<	[0/1] - Управление динамиком.
+	uint16_t 			WaitLD;				//<	[0/1] - Состояние проверки захвата.
+	float				CurrentFrequency;	//< [10e7...6*10e9] - Текущая частота.
+	float				DipFrequency[8];	//< Список частот.
+	float				DDS_HoldTime;		//< Время удержания частоты.
+	tsAD9106*			DDS;				//< Класс для работы с DDS.
+	tsLedCtrl			Led;				//< Индикационный светодиод.
+	tsDetector			Detector;			//< Параметры для работы с детектором.
+	tsSweepParameters	Sweep;				//<	Параметры свипа.
+	tsAttenuator	 	Attenuator;			//< Структура для работы с аттенюатором.
+	tsPulseModulator	PulseModulator;		//< Импульсный модулятор.
+}tsDeviceCfg;
+#pragma pack(pop)
+
+/**
+ * @brief
+ */
+#pragma pack(push,1)
+typedef struct
+{
+	uint8_t				SerialNumber[DMS_SERIAL_NUMBER_SIZE+2];	//< Серийный номер.
+	uint8_t				Date[DMS_DATE_SIZE+2];					//<	Дата производства.
+}tsDeviceInfo;
+#pragma pack(pop)
+
+#endif //	__H_DMS_DEVICE_
+
+/**************************** END OF FILE ***************************************/

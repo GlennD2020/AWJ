@@ -1,0 +1,7 @@
+21:50:10 **** Incremental Build of configuration Release for project dms_board_3.5ghz_v1 ****
+make -j12 all 
+arm-none-eabi-size   dms_board_3.5ghz_v1.elf 
+   text	   data	    bss	    dec	    hex	filename
+  38248	    656	   7552	  46456	   b578	dms_board_3.5ghz_v1.elf
+Finished building: default.size.stdout
+ 

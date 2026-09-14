@@ -1,0 +1,674 @@
+/****************************************************************************
+ * @file:		dms_functions.c												*
+ * @project:	DMS 3.5...3.8 GHz											*
+ * @author:		Kirillov A.V.												*
+ ****************************************************************************/
+#define __C_DMS_FUNCTIONS_
+
+/****************************************************************************
+ *					INCLUDES												*
+ ****************************************************************************/
+#include <dms_functions.h>
+#include <usbd_def.h>
+#include "usb_bulk.h"
+#include "detector.h"
+
+/****************************************************************************
+ *						MCU HARDWARE BLOCKS									*
+ ****************************************************************************/
+extern ADC_HandleTypeDef hadc1;
+extern DAC_HandleTypeDef hdac;
+extern I2C_HandleTypeDef hi2c1;
+extern SPI_HandleTypeDef hspi2;
+extern SPI_HandleTypeDef hspi3;
+extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
+extern TIM_HandleTypeDef htim3;
+extern TIM_HandleTypeDef htim4;
+extern TIM_HandleTypeDef htim5;
+
+/****************************************************************************
+ *						VARIABLES											*
+ ****************************************************************************/
+/** @brief	Количество функций в потоке №1.									*/
+static int	dms_thread1_size = 4;
+/** @brief	Количество функций в потоке №2.									*/
+static int	dms_thread2_size = 4;
+/** @brief	Индекс текущей функции потока №1.								*/
+static int	dms_thread1_index = 0;
+/** @brief	Индекс текущей функции потока №2.								*/
+static int	dms_thread2_index = 0;
+
+/** @brief	Счетчик моргания светодиода.									*/
+static long	dms_led_counter = 0;
+
+/** @brief Служебный счетчик для ожидания переходного процесса				*/
+static uint32_t dms_pll_wait_cnt = 0;
+
+/** @brief	Массив для приема данных через BULK								*/
+uint8_t 	usb_rx_buff[256];
+/** @brief	Счетчик данных принятых через BULK 								*/
+uint16_t	usb_rx_counter;
+/** @brief	Массив для отправки данных через BULK							*/
+uint8_t 	usb_tx_buff[256];
+/** @brief	Счетчик данных которые должны быть отправлены через BULK 		*/
+uint16_t	usb_tx_counter;
+
+/****************************************************************************
+ *						EXTERN VARIABLES									*
+ ****************************************************************************/
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
+/****************************************************************************
+ *						STATIC FUNCTIONS									*
+ ****************************************************************************/
+static void dms_calc_frequency			( void );
+
+/****************************************************************************
+ *				LOCAL DECLARATION OF THE THREAD FUNCTIONS					*
+ ****************************************************************************/
+static void dms_led_blinking 			( void );
+static void dms_check_recv_data 		( void );
+static void dms_send_data 				( void );
+static void dms_check_switch_state		( void );
+static void dms_check_detector_voltage	( void );
+static void dms_sweep_lo 				( void );
+
+/**
+ * @brief Array functions of the thread #1.
+ */
+void (*dms_thread1_funcs[]) ( void ) = {
+	dms_check_recv_data,
+	dms_send_data,
+};
+
+/**
+ * @brief Array functions of the thread #2.
+ */
+void (*dms_thread2_funcs[]) ( void ) = {
+	dms_led_blinking,
+	dms_check_switch_state,
+	dms_check_detector_voltage,
+	dms_sweep_lo,
+};
+
+/****************************************************************************
+ *				  APPLICATION FUNCTIONS										*
+ ****************************************************************************/
+/**
+ * @brief	Команда вызываемая для сохранения данных получаемых через USB.
+ * @param	Buf - Указатель на массив с принятыми данными.
+ * @param	Len - Кол-во принятых данных.
+ * @retval	NONE
+ */
+uint8_t dms_recv_bulk_data				( uint8_t *Buf, uint16_t *Len )
+{
+	for ( uint16_t i=0; i<*Len; i++ )
+	{
+		usb_rx_buff[usb_rx_counter+i] = Buf[i];
+	}
+	usb_rx_counter+=*Len;
+	return 0;
+}
+
+/**
+ *	@brief	Считывание текущего состояния переключатедей.
+ *	@retval	NONE.
+ */
+int dms_get_switch_state				( void )
+{
+	int state = 0;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW0_GPIO_Port, DIP_SW0_Pin ) == GPIO_PIN_RESET ) ? 0 : 1;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW1_GPIO_Port, DIP_SW1_Pin ) == GPIO_PIN_RESET ) ? 0 : 2;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW2_GPIO_Port, DIP_SW2_Pin ) == GPIO_PIN_RESET ) ? 0 : 4;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW3_GPIO_Port, DIP_SW3_Pin ) == GPIO_PIN_RESET ) ? 0 : 8;
+#ifdef DMS_DIP_ATTENUATOR_CONTROL
+	state += ( HAL_GPIO_ReadPin ( DIP_SW4_GPIO_Port, DIP_SW4_Pin ) == GPIO_PIN_RESET ) ? 0 : 16;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW5_GPIO_Port, DIP_SW5_Pin ) == GPIO_PIN_RESET ) ? 0 : 32;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW6_GPIO_Port, DIP_SW6_Pin ) == GPIO_PIN_RESET ) ? 0 : 64;
+	state += ( HAL_GPIO_ReadPin ( DIP_SW7_GPIO_Port, DIP_SW7_Pin ) == GPIO_PIN_RESET ) ? 0 : 128;
+#endif	//	DMS_DIP_ATTENUATOR_CONTROL
+	return state;
+}
+
+/**
+ * @brief	The function control of attenuator.
+ * @param	attenuator_ctrl - Состояние аттенюатора.
+ * @retval	NONE.
+ */
+static void dms_attenuator_control 		( int attenuator_ctrl )
+{
+	if ( DeviceCfg.Attenuator.Ctrl==0 )
+	{
+		//	Запуск ЦАП, установка предыдущего напряжения.
+		HAL_DAC_Start 	  ( &hdac, DAC1_CHANNEL_1 );
+		//	Устанавливаем ранее заданное ослабление.
+		HAL_DAC_SetValue  ( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac );
+	}
+	else
+	{
+		//	Запуск ЦАП, установка предыдущего напряжения.
+		HAL_DAC_Start 	  ( &hdac, DAC1_CHANNEL_1 );
+		//	Устанавливаем ранее заданное ослабление.
+		HAL_DAC_SetValue  ( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.DipDac [attenuator_ctrl] );
+	}
+}
+
+/**
+ *	@brief	Функция для считывания конфигурации устройства из внешней памяти.
+ *	@retval	Результат вычитывания конфигурации.
+ *			[0] - При считывании конфигурации произошла ошибка.
+ *			[1] - Считывания завершено успешно.
+ */
+static int dms_read_configuration 		( void )
+{
+	int				result = 1;
+	unsigned short	crc    = 0x0000;
+	unsigned char 	data [128];
+
+	//	Чтение конфигурационных регистров MAX2871 из I2C памяти.
+	result = AT24_I2C_MemoryRead ( EEPROM_SN_DESCRIPTION, data, 20 + 2 );
+	if ( result==1 )
+	{
+		crc = CalculateCRC16 ( data, 20 );
+		if ( crc==*((unsigned short*)&data[20]) )
+		{
+		}
+	}
+
+	return 1;
+}
+
+/**
+ * @brief	Функция инициализации структуры DeviceCfg.
+ * @retval	NONE.
+ */
+static void dms_init_configuration		( tsDeviceCfg* Cfg )
+{
+	///	Настройка параметров работы со светодиодом:
+	Cfg->Led.Ctrl = 1;
+	Cfg->Led.Interval = 100;
+
+	///	Задание параметров свипа:
+	Cfg->CurrentFrequency		= 2000000000.0;	//	Частота по умолчанию.
+	Cfg->WaitLD 				= 1;			//	Статус захвата частоты.
+	Cfg->RfOutState				= 1;			//	Статус состояния выхода.
+
+	Cfg->Sweep.BeginFrequency	= MAX2871_GetFrequency();
+	Cfg->Sweep.StepFrequency	= 0.0;
+	Cfg->Sweep.Points			= 1;
+	Cfg->Sweep.HoldTime			= 0.000005;
+
+	Cfg->Attenuator.Dac			= 2048;
+
+	///	Настройка динамика.
+	Cfg->BuzzerCtrl				= 0;
+
+	///	Настройка детектора.
+	Cfg->Detector.Ctrl			= 1;
+	Cfg->Detector.ReqVoltage	= 800;
+	Cfg->Detector.Voltage		= 0;
+}
+
+/**
+ *	@brief	Функция инициализации устройства.
+ *	@retval	0 - Данная функция всегда возвращяет 0.
+ */
+int dms_init						( void )
+{
+	dms_thread1_index 	= 0;
+	dms_thread1_size  	= sizeof(dms_thread1_funcs)/4;
+
+	dms_thread2_index 	= 0;
+	dms_thread2_size  	= sizeof(dms_thread2_funcs)/4;
+
+	usb_rx_counter		= 0;
+	memset ( usb_rx_buff, 0, 256 );
+
+	usb_tx_counter		= 0;
+	memset ( usb_tx_buff, 0, 256 );
+
+	dms_led_counter		= 0;
+
+	HAL_GPIO_WritePin ( LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET   );
+	HAL_GPIO_WritePin ( LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET );
+
+	sprintf ( (char*)DeviceInfo.SerialNumber, "%s", (char*)"0000000001" );
+	sprintf ( (char*)DeviceInfo.Date, "%s", (char*)"01012021" );
+
+	//	НАСТРОЙКА ПЕРИФЕРИИ:
+	//	Запуск ЦАП, установка предыдущего напряжения:
+	HAL_DAC_Start 	  		( &hdac, DAC1_CHANNEL_1 );
+	//	Устанавливаем максимальное ослабление:
+	HAL_DAC_SetValue  		( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 4095 );
+
+	//	Настройка библиотеки для работы с I2C памятью:
+	AT24_I2C_SetPeriph		( &hi2c1 );
+
+	//	Задание переферии необходимой для работы с MAX2871:
+	MAX2871_SetPeriph 		( PLL_LE_GPIO_Port, PLL_LE_Pin, PLL_LD_GPIO_Port, PLL_LD_Pin, PLL_MUXOUT_GPIO_Port, PLL_MUXOUT_Pin, &hspi2 );
+
+#if DMS_USE_AD5932==1
+	//	Задание переферии необходимой для работы с AD5932:
+	AD5932_SetPeriph  		( DDS_FSYNC_GPIO_Port, DDS_FSYNC_Pin, DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, DDS_INTERRUPT_GPIO_Port, DDS_INTERRUPT_Pin, &hspi3 );
+#else
+	HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_RESET );
+	//	Настройка периферии для работы с AD9106:
+	AD9106_SetPeriph		( &hspi3,
+							  DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin,
+							  DDS_CTRL_GPIO_Port, 	 DDS_CTRL_Pin,
+							  DDS_FSYNC_GPIO_Port, 	 DDS_FSYNC_Pin );
+#endif	///	DMS_USE_AD5932
+
+	//	Инициализация структуры с конфигурацией устройства:
+	dms_init_configuration	( &DeviceCfg );
+
+	//	Чтение конфигурации устройства:
+	dms_read_configuration	( );
+
+	//	Запуск ЦАП, установка предыдущего напряжения:
+	HAL_DAC_Start 	  		( &hdac, DAC1_CHANNEL_1 );
+	//	Устанавливаем максимальное ослабление:
+	HAL_DAC_SetValue  		( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac );
+
+	//	Инициализация микросхемы MAX2871:
+	MAX2871_Init 			( );
+	//	Установка частоты MAX2871:
+	MAX2871_SetFrequency 	( DeviceCfg.CurrentFrequency, 0 );
+
+#if DMS_USE_AD5932==1
+	//	Инициализация микросхемы AD5932:
+	AD5932_Init		  		( );
+#else
+	//	Инициализация микросхемы AD9106:
+	HAL_GPIO_WritePin 		( DDS_STANDBY_GPIO_Port, DDS_STANDBY_Pin, GPIO_PIN_SET );
+
+	AD9106_Init		  		( );
+
+	pulse_timer_ctrl 		( &htim4, TIM_CHANNEL_3, PULSE_TIMER_ON, 1000, 0.5 );
+#endif	///	DMS_USE_AD5932
+
+	return 0;
+}
+
+/**
+ *  @brief	Функция отправки ответа.
+ *  @param	Buf: Указатель на данные.
+ *  @param	Len: Размер данных.
+ *  @retval	NONE
+ */
+static void dms_send_answer				( uint8_t* Buf, uint16_t Len )
+{
+	for ( int i=0; i<Len; i++ )
+	{
+		usb_tx_buff[usb_tx_counter + i] = Buf[i];
+	}
+	usb_tx_counter += Len;
+}
+
+/**
+ *  @brief	Обработка принятой команды.
+ *  @param	Buf - Указатель на массив с принятыми данными.
+ *  @retval	Статус о завершении ошибки.
+ */
+static int dms_decode_receive_command	( uint8_t* Buf )
+{
+	uint8_t answer[SYSCOM_SIZE];
+	tsSysCmd* pRxCmd = (tsSysCmd*)Buf;
+	tsSysCmd* pTxCmd = (tsSysCmd*)answer;
+	int iParameter;
+
+	memset ( answer, 0, SYSCOM_SIZE );
+
+	pTxCmd->Type   = pRxCmd->Type;
+	pTxCmd->Status = CMD_DONE;
+
+	switch ( pRxCmd->Type )
+	{
+		case TEST_CONNECT:	//{ Тестовая команда.
+			break;	//}
+
+		case DEFAULT:	//{ Настройка устройства по умолчанию
+			dms_read_configuration ();
+			dms_init ();	
+			break;	//}
+
+		case GET_VERSIONS:	//{	Команда считывания версии платы и микропрограммы.
+			pTxCmd->Len 	= 4;
+			pTxCmd->data[0]	= 0;
+			pTxCmd->data[1]	= HARDWARE_VERSION;
+			pTxCmd->data[2]	= FIRMWARE_VERSION_MINOR;
+			pTxCmd->data[3]	= FIRMWARE_VERSION_MAJOR;
+			break;	//}
+
+		case GET_STATE:
+			pTxCmd->Len 	= 6;
+			pTxCmd->data[0]	= ( pTxCmd->data[0]&0xFE ) + MAX2871_GetMuxOut ( );	   // MUXOUT
+			pTxCmd->data[0]	= ( pTxCmd->data[0]&0xFD ) + ( MAX2871_GetLD ( )<<1 ); // LOCK DETECT
+			pTxCmd->data[1]	= 0x00;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Attenuator.Dac;
+			*((uint16_t*)&pTxCmd->data[4]) = (uint16_t)dms_get_switch_state ();
+			break;
+
+		case SET_CTRL_POWER_DET:	//{	Задание предельного уровня мощности.
+			if ( pRxCmd->Len==4 ) {
+				DeviceCfg.Detector.Ctrl 	  = *((uint16_t*)&pRxCmd->data[0]);
+				DeviceCfg.Detector.ReqVoltage = *((uint16_t*)&pRxCmd->data[2]);
+			} else {
+				pTxCmd->Status = CMD_RECV_CMD_ERROR;
+			}
+			break;	//}
+
+		case GET_CTRL_POWER_DET:	//{	Считывание состояния детектора.
+			pTxCmd->Len = 6;
+			*((uint16_t*)&pTxCmd->data[0]) = DeviceCfg.Detector.Ctrl;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Detector.ReqVoltage;
+			*((uint16_t*)&pTxCmd->data[4]) = DeviceCfg.Detector.Voltage;
+			break;	//}
+
+		case SET_DAC_VALUE:			//{	Установка значения ЦАП.
+			if ( pRxCmd->Len>=4 )
+			{
+				//	Флаг управления аттенюатором
+				DeviceCfg.Attenuator.Ctrl = *((uint16_t*)&pRxCmd->data[0]);
+				//	Значение ЦАП
+				DeviceCfg.Attenuator.Dac  = *((uint16_t*)&pRxCmd->data[2]);
+				//	Запуск ЦАП, установка предыдущего напряжения.
+				HAL_DAC_Start 	 ( &hdac, DAC1_CHANNEL_1 );
+				//	Устанавливаем ранее заданное ослабление.
+				HAL_DAC_SetValue ( &hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac );
+			}
+			break;	//}
+
+		case GET_DAC_VALUE:			//{	Считывание значения аттенюатора.
+			pTxCmd->Len = 4;
+			*((uint16_t*)&pTxCmd->data[0]) = DeviceCfg.Attenuator.Ctrl;
+			*((uint16_t*)&pTxCmd->data[2]) = DeviceCfg.Attenuator.Dac;
+			break;	//}
+
+		case SET_SWEEP_PLL:			//{ Установка параметров свипа.
+			if ( pRxCmd->Len>=18 )
+			{
+				DeviceCfg.Sweep.BeginFrequency = *((float*)&pRxCmd->data[0]);
+				DeviceCfg.Sweep.StepFrequency  = *((float*)&pRxCmd->data[4]);
+				DeviceCfg.Sweep.Points 		   = *((uint32_t*)&pRxCmd->data[8]);
+				DeviceCfg.Sweep.HoldTime   	   = *((float*)&pRxCmd->data[12]);
+				DeviceCfg.WaitLD 		   	   = *((uint8_t*)&pRxCmd->data[16]);
+				DeviceCfg.Sweep.OnOff 		   = *((uint8_t*)&pRxCmd->data[17]);
+				DeviceCfg.CurrentFrequency 	   = DeviceCfg.Sweep.BeginFrequency;
+				MAX2871_SetFrequency ( DeviceCfg.Sweep.BeginFrequency, DeviceCfg.WaitLD );
+			}
+			break;	//}
+
+		case GET_SWEEP_PLL:			//{	Считывание параметров свипа.
+			pTxCmd->Len = 18;
+			*((float*)&pTxCmd->data[0])	   = DeviceCfg.Sweep.BeginFrequency;
+			*((float*)&pTxCmd->data[4])	   = DeviceCfg.Sweep.StepFrequency;
+			*((uint32_t*)&pTxCmd->data[8]) = DeviceCfg.Sweep.Points;
+			*((float*)&pTxCmd->data[12])   = DeviceCfg.Sweep.HoldTime;
+			*((uint8_t*)&pTxCmd->data[16]) = DeviceCfg.WaitLD;
+			*((uint8_t*)&pTxCmd->data[17]) = DeviceCfg.Sweep.OnOff;
+			break;	//}
+
+		case SET_DDS_REG:
+			if ( pRxCmd->Len==4 )
+			{
+				//	Структура принятой команды:
+				//	0..1 - Адрес.
+				//	2..3 - Регистр.
+				
+				//	Запись регистра DDS с сохранением внутреннем буфере.
+				AD9106_WriteRegister ( *((uint16_t*)&pRxCmd->data[2]), *((uint16_t*)&pRxCmd->data[0]) );
+			}
+			break;
+
+		case GET_DDS_REG:
+			if ( pRxCmd->Len==2 )
+			{
+				pTxCmd->Len = 4;
+
+				*((float*)&pTxCmd->data[0])	= *((uint16_t*)&pRxCmd->data[0]);
+				*((float*)&pTxCmd->data[2]) = AD9106_GetRegister ( *((uint16_t*)&pRxCmd->data[0])] );
+			}
+			break;
+
+		case READ_MEMORY:			//{ Считывание данных из I2C памяти
+			break;	//}
+
+		case WRITE_MEMORY:			//{ Запись данных в I2C память .
+			break;	//}
+
+		case SET_PLL_REG:			//{	Запись регистра ФАПЧ.
+			if ( pRxCmd->Len==4 ) {
+				MAX2871_SetRegister ( *((unsigned long*)&pRxCmd->data[0]) );
+			}
+			break;	//}
+
+		case GET_PLL_REG:			//{	Считывание регистра ФАПЧ.
+			if (pRxCmd->Len >= 2) {
+				iParameter	= *((int*)&pRxCmd->data[0]);
+				pTxCmd->Len = 4;
+				*((unsigned long*)&pTxCmd->data[0]) = MAX2871_GetRegister ( iParameter );
+			}
+			break;	//}
+
+		default:
+			pTxCmd->Status = CMD_UNDEFINED;
+			break;
+	}
+
+	dms_send_answer ( answer, SYSCOM_SIZE );
+
+	return 0;
+}
+
+/**
+ * @brief	Расчет следующей частоты СЧ гетеродина.
+ * @retval	NONE
+ */
+static void dms_calc_frequency			( void )
+{
+	float fEndFreq = (((float)DeviceCfg.Sweep.Points)-1.0F);
+
+	fEndFreq = DeviceCfg.Sweep.BeginFrequency + (float)(fEndFreq * DeviceCfg.Sweep.StepFrequency);
+
+	DeviceCfg.CurrentFrequency += DeviceCfg.Sweep.StepFrequency;
+	if ( DeviceCfg.CurrentFrequency>fEndFreq )
+	{
+		DeviceCfg.CurrentFrequency = DeviceCfg.Sweep.BeginFrequency;
+	}
+}
+
+/****************************************************************************
+ *					THREAD FUNCTIONS										*
+ ****************************************************************************/
+/****************************************************************************
+ *			SERVICE FUNCTIONS OF THE THREADS								*
+ ****************************************************************************/
+/**
+ *	@brief	Функция установки следующего этапа потока.
+ *	@retval	NONE.
+ */
+static void dms_thread1_next_func		( void )
+{
+	dms_thread1_index++;
+	if ( dms_thread1_index>=dms_thread1_size )
+	{
+		dms_thread1_index = 0;
+	}
+}
+
+/**
+ *	@brief	Функция установки следующего этапа потока.
+ *	@retval	NONE.
+ */
+static void dms_thread2_next_func		( void )
+{
+	dms_thread2_index++;
+	if ( dms_thread2_index>=dms_thread2_size )
+	{
+		dms_thread2_index = 0;
+	}
+}
+
+/****************************************************************************
+ *						THREAD 1											*
+ ****************************************************************************/
+/**
+ * @brief	Проверка принимаемых данных.
+ * @retval	NONE
+ */
+static void dms_check_recv_data			( void )
+{
+	if ( usb_rx_counter>=SYSCOM_SIZE )
+	{
+		dms_decode_receive_command (usb_rx_buff);
+
+		usb_rx_counter-=SYSCOM_SIZE;
+		for ( int i=0; i<usb_rx_counter; i++ )
+		{
+			usb_rx_buff[i] = usb_rx_buff[i+SYSCOM_SIZE];
+		}
+	}
+	dms_thread1_next_func ( );
+}
+
+/**
+ * @brief	Функция передачи данных.
+ * @retval	NONE
+ */
+static void dms_send_data 				( void )
+{
+	if ( usb_tx_counter>=SYSCOM_SIZE )
+	{
+		USBD_BULK_TransmitData ( &hUsbDeviceFS, usb_tx_buff, SYSCOM_SIZE );
+
+		usb_tx_counter-=SYSCOM_SIZE;
+		for ( int i=0; i<usb_tx_counter; i++ )
+		{
+			usb_tx_buff[i] = usb_tx_buff[i+SYSCOM_SIZE];
+		}
+	}
+	dms_thread1_next_func ( );
+}
+
+/****************************************************************************
+ *						THREAD 2											*
+ ****************************************************************************/
+/**
+ * @brief	Функция моргания светодиодом.
+ * @retval	NONE
+ */
+static void dms_led_blinking 			( void )
+{
+	if ( DeviceCfg.Led.Ctrl==1 )
+	{
+		if ( dms_led_counter>(DeviceCfg.Led.Interval*1000) )
+		{
+			dms_led_counter=0;
+			HAL_GPIO_TogglePin ( LED2_GPIO_Port, LED2_Pin );
+			HAL_GPIO_TogglePin ( LED3_GPIO_Port, LED3_Pin );
+		}
+		else
+		{
+			dms_led_counter++;
+		}
+	}
+	else
+	{
+		HAL_GPIO_WritePin ( LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET   );
+		HAL_GPIO_WritePin ( LED3_GPIO_Port, LED3_Pin, GPIO_PIN_RESET );
+	}
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Проверка состояния переключателей.
+ * @retval	NONE
+ */
+static void dms_check_switch_state		( void )
+{
+	//	Read current state of switches.
+	int switch_state = dms_get_switch_state ( );
+
+	if ( DeviceCfg.Sweep.OnOff==0 )
+	{
+		if ( DeviceCfg.CurrentFrequency!=DeviceCfg.DipFrequency[switch_state&0x0F] )
+		{
+			DeviceCfg.Sweep.BeginFrequency = DeviceCfg.CurrentFrequency = DeviceCfg.DipFrequency[switch_state&0x0F];
+		}
+	}
+
+#ifdef DMS_DIP_ATTENUATOR_CONTROL
+	dms_attenuator_control ( (int)((switch_state>>4)&0x0F) );
+#endif	//	DMS_DIP_ATTENUATOR_CONTROL
+
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Измерение напряжения на входе детектора мощности.
+ * @retval	NONE
+ */
+static void dms_check_detector_voltage	( void )
+{
+	DeviceCfg.Detector.Voltage = detector_measure ( DeviceCfg.Detector.Ctrl );
+
+	dms_thread2_next_func ( );
+}
+
+/**
+ * @brief	Функция перестройки частоты гетеродина.
+ * @retval	NONE.
+ */
+static void dms_sweep_lo 				( void )
+{
+	if ( DeviceCfg.Sweep.OnOff==1 )
+	{
+		if ( DeviceCfg.WaitLD==1 )
+		{
+			if ( MAX2871_GetLD()==0 )	//	Отсутствует захват частоты.
+			{
+				if ( dms_pll_wait_cnt>1000000000 )
+				{
+					dms_pll_wait_cnt = 0;
+					MAX2871_SetFrequency ( DeviceCfg.CurrentFrequency, 0 );
+				}
+				else
+				{
+					dms_pll_wait_cnt++;
+				}
+				dms_thread2_next_func ( );	//	Переход к следующей функции.
+				return;
+			}
+			else
+			{
+
+			}
+		}
+
+		dms_calc_frequency ();
+	}
+	else
+	{
+	}
+	dms_thread2_next_func ( );
+}
+
+/****************************************************************************
+ *					MAIN THREAD FUNCTION									*
+ ****************************************************************************/
+/**
+ * @brief	Главная функция управления потоками.
+ * @retval	NONE
+ */
+void dms_thread_func 					( void )
+{
+	//	Поток №1
+	dms_thread1_funcs[dms_thread1_index]( );
+
+	//	Поток №2
+	dms_thread2_funcs[dms_thread2_index]( );
+}
+
+/********************  END OF FILE  *****************************************/
