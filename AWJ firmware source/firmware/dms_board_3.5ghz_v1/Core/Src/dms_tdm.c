@@ -517,12 +517,12 @@ int tdm_start(void)
     /* Force bandwidth reconfigure on first hop */
     TdmCfg.current_bw = 0.0f;
 
-    /* Set attenuator to 0 dB (DAC=0).
-     * Default boot value is DAC=2048 (23 dB) because EEPROM load fails.
-     * Band table attenuation is applied per-band during hopping. */
-    DeviceCfg.Attenuator.Dac[0] = 0;
+    /* K9 FIX: Apply the SAVED attenuator setting (position 0), loaded from
+     * EEPROM on boot / set live via the software attenuator box + SAVE TO DEVICE.
+     * Previously this was forced to DAC=0 (full power), which silently overrode
+     * whatever attenuation the user set and saved. */
     HAL_DAC_Start(&hdac, DAC1_CHANNEL_1);
-    HAL_DAC_SetValue(&hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 0);
+    HAL_DAC_SetValue(&hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, DeviceCfg.Attenuator.Dac[0]);
 
     /* Set initial band */
     TdmCfg.active_idx = 0;
