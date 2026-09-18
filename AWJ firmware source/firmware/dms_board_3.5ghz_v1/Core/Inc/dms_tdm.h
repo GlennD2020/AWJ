@@ -2,7 +2,7 @@
  * @file:       dms_tdm.h
  * @project:    DMS - Time Division Multiplexed Jamming
  * @author:     K9 Electronics Ltd
- * @date:       2025
+ * @build:      2026-09-18a  (per-band atten_dac field in TDM band struct)
  * @brief:      Standalone TDM multi-band frequency hopping.
  *              Enables autonomous multi-band jamming without PC connection.
  *              Bands configured via USB, stored in EEPROM, executed on STM32.
@@ -97,7 +97,7 @@ typedef struct
     float       dds_ctrl_freq;      /**< DDS control clock frequency in Hz */
     uint8_t     active;             /**< 1=include in TDM cycle, 0=skip */
     uint8_t     dds_mode;           /**< TDM_DDS_MODE_RAMP(0), PRBS(1), or RANDOM(2) */
-    uint8_t     reserved[2];        /**< Pad to 28 bytes */
+    uint16_t    atten_dac;          /**< Per-band attenuator DAC code (0xFFFF or 0 = use main attenuator). Was reserved[2]; same 2 bytes, offset 26. */
 } tsTdmBand;
 #pragma pack(pop)
 
