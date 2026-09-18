@@ -1,7 +1,8 @@
 /**
  * @File:   FmMain.cs
  * @Author: K9 Electronics.
- * @Date:   09/02/2026
+ * @Build:  2026-09-18a  (per-band attenuation + save-commit fix)
+ *          Shown in the app title bar — must match what's on screen.
  */
 using System;
 using System.Collections.Generic;
@@ -212,6 +213,9 @@ namespace dms_control_v3
         private float[] tdmEepromCtrlFreq = new float[8];
         private bool[] tdmEepromActive = new bool[8];
         private byte[] tdmEepromDdsMode = new byte[8];  // 0=RAMP, 1=PRBS
+        private ushort[] tdmEepromAtten = new ushort[8];  // per-band atten DAC (0xFFFF/0 = use main)
+        // K9 build stamp — shows in the title bar so you can confirm which build is running.
+        private const string K9_BUILD = "build 2026-09-18a (per-band atten)";
                 private bool[] tdmEepromBandValid = new bool[8];
         // ── DIAGNOSTIC: raw EEPROM readback bytes ──
         private byte[] tdmDiagRawHeader = null;
@@ -899,7 +903,7 @@ namespace dms_control_v3
                 if (bStatus == false)
                 {
                     this.tlspbtConnect.Text = "Connect";
-                    this.Text = "AWJ v3.0h";
+                    this.Text = "AWJ v3.0h  " + K9_BUILD;
                     this.tlspSerialNumber.Text = "SN:";
                     this.tlspStatusPanel.Maximum = 0;
                     this.tlspStatusPanel.Value = 0;
@@ -1572,10 +1576,21 @@ namespace dms_control_v3
                                 ? (ddsMode == "PRBS" ? Color.FromArgb(255, 200, 200) : Color.FromArgb(200, 255, 200))
                                 : Color.FromArgb(255, 220, 220);
 
+                            // Convert the saved per-band atten DAC back to dB for display.
+                            // 0xFFFF or 0 = no per-band value (blank => uses main attenuator).
+                            double bandAttenDb = 0.0;
+                            ushort adCode = tdmEepromAtten[i];
+                            if (adCode != 0xFFFF && adCode != 0 &&
+                                device != null && device.AttCalibrationTable != null)
+                            {
+                                float v = (float)(((double)adCode / 4096.0) * 3.3);
+                                bandAttenDb = Math.Round((double)device.AttCalibrationTable.getAttenuation(v), 1);
+                            }
+
                             AddBandRow("", "Triggered",
                                 string.Format("TDM Band {0}", i + 1),
                                 freqMhz, bwMhz, 100.0, active, tones, rowColor, ddsMode,
-                                0.0, tdmEepromCtrlFreq[i]);
+                                bandAttenDb, tdmEepromCtrlFreq[i]);
                             loadedCount++;
                         }
 
@@ -1985,6 +2000,7 @@ namespace dms_control_v3
                             tdmEepromCtrlFreq[bandIdx] = BitConverter.ToSingle(array, 20);
                             tdmEepromActive[bandIdx] = (array[24] != 0);
                             tdmEepromDdsMode[bandIdx] = array[25];  // 0=RAMP, 1=PRBS, 2=RANDOM
+                            tdmEepromAtten[bandIdx] = (ushort)(array[26] | (array[27] << 8));  // per-band atten DAC
                             tdmEepromBandValid[bandIdx] = (tdmEepromLoFreq[bandIdx] > 1e6);
                             string[] mNames = { "RAMP", "PRBS", "RANDOM" };
                             string mN = (tdmEepromDdsMode[bandIdx] < mNames.Length) ? mNames[tdmEepromDdsMode[bandIdx]] : "?";
@@ -2536,7 +2552,7 @@ namespace dms_control_v3
                         throw new Exception("Device Not Found.");
                     }
 
-                    this.Text = "AWJ v3.0h — " + String.Format("{0:s}", usbConnection.Info.ProductString);
+                    this.Text = "AWJ v3.0h  " + K9_BUILD + " — " + String.Format("{0:s}", usbConnection.Info.ProductString);
                     tlspSerialNumber.Text = String.Format("SN: {0:s}", usbConnection.Info.SerialString);
                     sSerialNumber = usbConnection.Info.SerialString;
                     writeEndpoint = usbConnection.OpenEndpointWriter(WriteEndpointID.Ep01);
@@ -4979,6 +4995,15 @@ namespace dms_control_v3
         // ════════════════════════════════════════════════════════════
         private void btnTdmSaveStandalone_Click(object sender, EventArgs e)
         {
+            // K9: Commit any in-progress grid edit BEFORE reading cells, so a value
+            // just typed (e.g. Atten dB) is captured instead of the old cell value.
+            if (dgvBands != null)
+            {
+                dgvBands.EndEdit();
+                if (dgvBands.IsCurrentCellDirty)
+                    dgvBands.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+
             if (!guiActive || usbConnection == null || !usbConnection.IsOpen)
             {
                 MessageBox.Show("Device not connected!\nConnect the DMS hardware first.",
@@ -5447,7 +5472,30 @@ namespace dms_control_v3
                     Array.Copy(BitConverter.GetBytes(ddsCtrlFreq), 0, bandData, 20, 4);   // float dds_ctrl_freq
                     bandData[24] = (byte)(active ? 1 : 0);                                // uint8 active
                     bandData[25] = ddsModeVal;                                             // uint8 dds_mode (0=RAMP, 1=PRBS, 2=RANDOM)
-                    bandData[26] = 0; bandData[27] = 0;                                   // reserved[2]
+                    // Per-band attenuation: convert the Atten dB cell to a DAC code and
+                    // pack into bytes 26-27 (was reserved[2]). 0xFFFF = blank => firmware
+                    // falls back to the main attenuator. Matches live HopToFrequency scaling.
+                    ushort attenDac = 0xFFFF;
+                    if (dgvBands.Columns.Contains("colAttenDb") && row.Cells["colAttenDb"].Value != null)
+                    {
+                        string aVal = row.Cells["colAttenDb"].Value.ToString().Trim();
+                        if (aVal != "")
+                        {
+                            try
+                            {
+                                double aDb = Convert.ToDouble(aVal);
+                                if (aDb > 0.0 && device != null && device.AttCalibrationTable != null)
+                                {
+                                    double clampedDb = Math.Max(0, Math.Min(25, aDb));
+                                    float v = device.AttCalibrationTable.getVoltage((float)clampedDb);
+                                    attenDac = (ushort)((v / 3.3f) * 4096.0f);
+                                }
+                            }
+                            catch { attenDac = 0xFFFF; }
+                        }
+                    }
+                    bandData[26] = (byte)(attenDac & 0xFF);
+                    bandData[27] = (byte)((attenDac >> 8) & 0xFF);         // per-band atten DAC (little-endian)
                     ushort bandCrc = nsAlexKir.MathLibrary.CRC.CalculateCRC16(bandData, 28);
                     bandData[28] = (byte)(bandCrc & 0xFF);
                     bandData[29] = (byte)((bandCrc >> 8) & 0xFF);
