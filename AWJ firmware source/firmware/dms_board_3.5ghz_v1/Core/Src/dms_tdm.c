@@ -2,7 +2,7 @@
  * @file:       dms_tdm.c
  * @project:    DMS - Time Division Multiplexed Jamming
  * @author:     K9 Electronics Ltd
- * @date:       2025
+ * @build:      2026-09-18a  (per-band attenuation applied per hop)
  * @brief:      Standalone TDM multi-band frequency hopping module.
  *
  *  This module adds autonomous multi-band jamming capability to the DMS
@@ -705,8 +705,7 @@ int tdm_process_command(void* rxCmd, void* txCmd)
                 band.dds_ctrl_freq  = *((float*)&pRx->data[21]);
                 band.active         = pRx->data[25];
                 band.dds_mode       = (pRx->Len >= 27) ? pRx->data[26] : 0;  /* Default RAMP */
-                band.reserved[0]    = 0;
-                band.reserved[1]    = 0;
+                band.atten_dac      = 0xFFFF;  /* live single-band set: use main attenuator */
 
                 if (tdm_set_band(idx, &band) != 0)
                     pTx->Status = CMD_RECV_CMD_ERROR;
@@ -1684,6 +1683,19 @@ static void tdm_reconfigure_dds_bandwidth(tsTdmBand* band)
 static void tdm_hop_to_band(uint8_t band_idx)
 {
     tsTdmBand* band = &TdmCfg.bands[band_idx];
+
+    /* ── K9: Per-band attenuation ──
+     * Apply this band's own attenuator setting on every hop.
+     * 0xFFFF or 0 = "no per-band value set" → fall back to the main
+     * attenuator (Position 0). Runs before every fast-path return below,
+     * so it applies in all modes. HAL_DAC_SetValue is an internal register
+     * write (~sub-µs), so it does not disturb hot-hop timing. */
+    {
+        uint16_t atten = band->atten_dac;
+        if (atten == 0xFFFF || atten == 0)
+            atten = DeviceCfg.Attenuator.Dac[0];
+        HAL_DAC_SetValue(&hdac, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, atten);
+    }
 
     /* ── PRBS fast path: move PLL + update timer if BW differs ── */
     if (band->dds_mode == TDM_DDS_MODE_PRBS &&
